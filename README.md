@@ -4,6 +4,8 @@
 
 ![KILN](docs/images/screenshot.png)
 
+![KILN analog face](docs/images/analog.png)
+
 KILN has six saturation types with three variants each. TAME runs before the drive and takes the harsh resonances out, so you can push hard without fizz. It has two faces over the same controls: DIGITAL (spectrum, curve and harmonics) and ANALOG (a worn rack unit).
 
 ## Features
