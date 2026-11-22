@@ -14,9 +14,9 @@ use crate::presets::PresetBar;
 use crate::sat;
 use crate::tame::{band_freq, BANDS};
 use crate::{get, Shared};
-use nih_plug::prelude::*;
-use nih_plug_egui::create_egui_editor;
-use nih_plug_egui::egui::{
+use nice_plug::prelude::*;
+use nice_plug_egui::create_egui_editor;
+use egui::{
     self, pos2, vec2, Align2, Color32, ColorImage, FontData, FontDefinitions, FontFamily, FontId, Painter, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, TextureHandle,
     TextureOptions,
 };
@@ -50,6 +50,9 @@ struct St {
     eq_tab: bool,
     /// 0.2: ANALOG's DRIVE moves every band together
     last_drive: Option<f32>,
+    /// ANALOG pitch wheel: drawn roll angle + drag accumulator
+    wheel_spin: f32,
+    wheel_acc: f32,
     /// a ConsoleEq used only to draw the EQ curve
     eqv: crate::sat::ConsoleEq,
 }
@@ -70,14 +73,22 @@ fn new_st(preset_dir: &'static str) -> St {
         band: 0,
         eq_tab: false,
         last_drive: None,
+        wheel_spin: 0.0,
+        wheel_acc: 0.0,
         eqv: crate::sat::ConsoleEq::new(48000.0),
     }
 }
 
-pub(crate) fn create(params: Arc<KilnParams>, shared: Arc<Shared>) -> Option<Box<dyn Editor>> {
+pub(crate) fn create(params: Arc<KilnParams>, shared: Arc<Shared>) -> Option<crate::nice_app::AwkEditor> {
     let state = params.editor_state.clone();
     let st = new_st("Kiln");
-    create_egui_editor(state, st, |ctx, _| fonts(ctx), move |ctx, setter, st| frame(ctx, setter, st, params.as_ref(), shared.as_ref()))
+    create_egui_editor(state, nice_plug_egui::RepaintNotifier::new(), nice_plug_egui::EguiNiceSettings::default(), crate::nice_app::AwkApp::new(fonts, {
+        let mut __st = st;
+        Box::new(move |ctx: &mut egui::Ui, setter: &ParamSetter| {
+            let st = &mut __st;
+            frame(ctx, setter, st, params.as_ref(), shared.as_ref())
+        })
+    }))
 }
 
 fn fonts(ctx: &egui::Context) {
@@ -189,7 +200,9 @@ fn set_type(setter: &ParamSetter, p: &KilnParams, t: i32) {
     }
 }
 
-fn frame(ctx: &egui::Context, setter: &ParamSetter, st: &mut St, p: &KilnParams, sh: &Shared) {
+fn frame(root: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnParams, sh: &Shared) {
+    let ctx_owned = root.ctx().clone();
+    let ctx = &ctx_owned;
     ctx.request_repaint_after(std::time::Duration::from_millis(33));
     st.skin.begin(ctx);
     st.an_in.update(&sh.spec_in);
@@ -210,7 +223,7 @@ fn frame(ctx: &egui::Context, setter: &ParamSetter, st: &mut St, p: &KilnParams,
         st.harm = sat::harmonics(bty.value(), bvar.value(), bcolor.value(), bdrive.value());
     }
     st.eqv.configure(eq_set(p));
-    egui::CentralPanel::default().frame(egui::Frame::NONE.fill(rgb(0x0c, 0x0a, 0x08))).show(ctx, |ui| {
+    egui::CentralPanel::default().frame(egui::Frame::NONE.fill(rgb(0x0c, 0x0a, 0x08))).show(root, |ui| {
         let whole = ui.max_rect();
         st.skin.background(ui.painter(), whole);
         let o = whole.min.to_vec2();
@@ -245,7 +258,7 @@ fn mode_pill(ui: &mut egui::Ui, p: &KilnParams, r: Rect, now: f64) {
     pa.rect_filled(hl, hl.height() / 2.0, if analog { rgb(0x5a, 0x3a, 0x1e) } else { rgb(0x2f, 0x2a, 0x24) });
     for (i, s) in ["DIGITAL", "ANALOG"].iter().enumerate() {
         let rr = Rect::from_min_size(r.min + vec2(i as f32 * half, 0.0), vec2(half, r.height()));
-        let resp = ui.interact(rr, ui.id().with(("mode", i)), Sense::click());
+        let resp = ui.interact(rr, ui.scope_id().with(("mode", i)), Sense::click());
         let on = (i == 1) == analog;
         let col = if on { if i == 1 { HEAT } else { rgb(0xf6, 0xef, 0xe4) } } else if resp.hovered() { rgb(0xb8, 0xad, 0x9f) } else { rgb(0x7d, 0x72, 0x66) };
         txt(&pa, rr.center(), Align2::CENTER_CENTER, *s, labb(12.0), col, 2.0);
@@ -315,7 +328,7 @@ fn digital_face(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnPa
     let cur = bty.value();
     for (i, ty) in TYPES.iter().enumerate() {
         let r = rc(18.0 + i as f32 * (tw + 8.0), 334.0, tw, 52.0);
-        let resp = ui.interact(r, ui.id().with(("tile", i)), Sense::click());
+        let resp = ui.interact(r, ui.scope_id().with(("tile", i)), Sense::click());
         let on = cur == i as i32;
         pa.rect_filled(r, 3.0, if on { rgb(0x2b, 0x24, 0x1b) } else if resp.hovered() { rgb(0x1c, 0x18, 0x13) } else { rgb(0x14, 0x11, 0x0e) });
         pa.rect_stroke(r, 3.0, Stroke::new(if on { 1.5_f32 } else { 1.0_f32 }, if on { HEAT } else { rgb(0x2e, 0x27, 0x20) }), StrokeKind::Inside);
@@ -457,7 +470,7 @@ fn spectrum(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnParams
         }
         for (k, (x, prm)) in [(xl, &p.tlo), (xh, &p.thi)].into_iter().enumerate() {
             let hr = Rect::from_min_max(pos2(x - 6.0, top), pos2(x + 6.0, (top + bot) / 2.0));
-            let id = ui.id().with(("trange", k));
+            let id = ui.scope_id().with(("trange", k));
             let resp = ui.interact(hr, id, Sense::click_and_drag());
             knob_like_freq(ui, setter, &resp, prm, mapx, x0, x1);
             let col = al(COOL, if resp.hovered() || resp.dragged() { 0.9 } else { 0.45 });
@@ -480,7 +493,7 @@ fn spectrum(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnParams
         }
         let hx = if on { x } else if k == 0 { x0 + 6.0 } else { x1 - 6.0 };
         let hr = Rect::from_min_max(pos2(hx - 7.0, (top + bot) / 2.0), pos2(hx + 7.0, bot));
-        let resp = ui.interact(hr, ui.id().with(("srange", k)), Sense::click_and_drag());
+        let resp = ui.interact(hr, ui.scope_id().with(("srange", k)), Sense::click_and_drag());
         knob_like_freq(ui, setter, &resp, prm, mapx, x0, x1);
         let hot = resp.hovered() || resp.dragged();
         let col = al(HEAT, if hot { 0.95 } else if on { 0.6 } else { 0.3 });
@@ -578,7 +591,7 @@ fn spectrum(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnParams
         for bi in 0..nb {
             let (el, er) = (edges[bi], edges[bi + 1].max(edges[bi] + 1.0));
             let br = Rect::from_min_max(pos2(el, bot - 22.0), pos2(er, bot));
-            let resp = ui.interact(br, ui.id().with(("bandsel", bi)), Sense::click());
+            let resp = ui.interact(br, ui.scope_id().with(("bandsel", bi)), Sense::click());
             if resp.clicked() {
                 st.band = bi;
             }
@@ -595,7 +608,7 @@ fn spectrum(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnParams
             let x = mapx(fu(prm.value()));
             let my = (top + bot) * 0.5;
             let hr = Rect::from_min_max(pos2(x - 7.0, my), pos2(x + 7.0, bot - 24.0));
-            let resp = ui.interact(hr, ui.id().with(("xover", k)), Sense::click_and_drag());
+            let resp = ui.interact(hr, ui.scope_id().with(("xover", k)), Sense::click_and_drag());
             knob_like_freq(ui, setter, &resp, prm, mapx, x0, x1);
             let hot = resp.hovered() || resp.dragged();
             line(&pa, pos2(x, top), pos2(x, bot), al(HEAT, if hot { 0.9 } else { 0.5 }), 1.5);
@@ -798,7 +811,7 @@ fn worn_image() -> ColorImage {
     }
     // vignette + polished spots
     let spots: Vec<(f32, f32, f32)> = (0..5).map(|_| (300.0 + rnd.f() * 1400.0, 820.0 + rnd.f() * 240.0, 80.0 + rnd.f() * 80.0)).collect();
-    let mut img = ColorImage::new([w, h], Color32::BLACK);
+    let mut img = ColorImage::filled([w, h], Color32::BLACK);
     for y in 0..h {
         for x in 0..w {
             let q = px[y * w + x];
@@ -851,6 +864,7 @@ fn lamp(pa: &Painter, c: Pos2, col: Color32, on: bool) {
     }
 }
 
+#[allow(dead_code)]
 /// Bat-handle toggle. `ang` is where the lever points (0 = up).
 fn bat(pa: &Painter, c: Pos2, ang: f32) {
     disc_radial(pa, c, 12.0, rgb(0xe4, 0xdf, 0xd4), rgb(0x5b, 0x57, 0x4f), vec2(-3.0, -3.0));
@@ -868,7 +882,7 @@ fn bat(pa: &Painter, c: Pos2, ang: f32) {
 /// Chicken-head pointer knob with a printed 0-10 scale. Returns the response.
 #[allow(clippy::too_many_arguments)]
 fn chicken<P: Param>(ui: &mut egui::Ui, setter: &ParamSetter, c: Pos2, r: f32, param: &P, label: &str, col: Color32, dim: bool, scale: bool) -> Response {
-    let id = ui.id().with(("chick", label, c.x as i32, c.y as i32));
+    let id = ui.scope_id().with(("chick", label, c.x as i32, c.y as i32));
     let resp = ui.interact(Rect::from_center_size(c, egui::Vec2::splat(r * 2.0 + 16.0)), id, Sense::click_and_drag());
     knob_input(ui, setter, &resp, id, param);
     let pa = ui.painter().clone();
@@ -935,26 +949,30 @@ fn vu(pa: &Painter, r: Rect, val: f32, warm: f32) {
         pa.rect_filled(rr.intersect(r), 0.0, Color32::from_rgba_unmultiplied(255, 170, 60, (warm * 10.0) as u8));
     }
     let cp = pa.with_clip_rect(r);
-    let piv = pos2(r.center().x, r.bottom() + 40.0);
-    let rad = r.height() + 4.0;
-    let vmap = |d: f32| -PI / 2.0 + (((d + 20.0) / 23.0).clamp(0.0, 1.0) - 0.5) * 1.5;
+    // everything on the scale comes from ONE pivot and ONE radius
+    let piv = pos2(r.center().x, r.bottom() + 30.0);
+    let rad = r.height() - 20.0;
+    let amp = |d: f32| 10f32.powf(d / 20.0);
+    let (a0, a1) = (amp(-20.0), amp(3.0));
+    // real VU spacing: position follows voltage, so 0 VU sits ~70% across
+    let vmap = move |d: f32| -PI / 2.0 + ((amp(d.clamp(-20.0, 3.0)) - a0) / (a1 - a0) - 0.5) * 1.48;
     let ink = rgb(0x2a, 0x24, 0x1c);
     let red = rgb(0xb3, 0x26, 0x1e);
+    cp.add(Shape::line(arc_pts(piv, rad, vmap(-20.0), vmap(0.0), 48), Stroke::new(1.3_f32, ink)));
+    cp.add(Shape::line(arc_pts(piv, rad + 2.0, vmap(0.0), vmap(3.0), 20), Stroke::new(4.0_f32, red)));
     for d in [-20.0f32, -10.0, -7.0, -5.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0] {
         let a = vmap(d);
         let long = d as i32 % 5 == 0 || d > -4.0;
         let col = if d > 0.0 { red } else { ink };
-        line(&cp, polar(piv, a, rad - 30.0), polar(piv, a, rad - if long { 18.0 } else { 24.0 }), col, 1.4);
+        line(&cp, polar(piv, a, rad), polar(piv, a, rad + if long { 11.0 } else { 7.0 }), col, 1.4);
         let s = if d > 0.0 { format!("+{}", d as i32) } else { format!("{}", (d as i32).abs()) };
-        txt(&cp, polar(piv, a, rad - 8.0), Align2::CENTER_CENTER, s, osw(10.0), col, 0.0);
+        txt(&cp, polar(piv, a, rad + 21.0), Align2::CENTER_CENTER, s, osw(10.0), col, 0.0);
     }
-    cp.add(Shape::line(arc_pts(piv, rad - 31.0, vmap(0.0), vmap(3.0), 16), Stroke::new(3.0_f32, red)));
-    cp.add(Shape::line(arc_pts(piv, rad - 31.0, vmap(-20.0), vmap(0.0), 40), Stroke::new(1.2_f32, ink)));
     txt(&cp, pos2(piv.x, r.bottom() - 34.0), Align2::CENTER_CENTER, "VU", osw(22.0), ink, 2.0);
     txt(&cp, pos2(piv.x, r.bottom() - 14.0), Align2::CENTER_CENTER, "KILN · OUTPUT", typ(9.0), rgb(0x5a, 0x4d, 0x3a), 1.0);
     let a = vmap(val);
-    line(&cp, piv + vec2(2.0, 1.0), polar(piv, a, rad - 14.0) + vec2(2.0, 1.0), Color32::from_black_alpha(70), 2.0);
-    line(&cp, piv, polar(piv, a, rad - 14.0), rgb(0x14, 0x12, 0x10), 1.6);
+    line(&cp, piv + vec2(2.0, 1.0), polar(piv, a, rad + 5.0) + vec2(2.0, 1.0), Color32::from_black_alpha(70), 2.0);
+    line(&cp, piv, polar(piv, a, rad + 5.0), rgb(0x14, 0x12, 0x10), 1.6);
     // glass glare
     let mut m = egui::Mesh::default();
     m.colored_vertex(r.left_top(), Color32::from_white_alpha(60));
@@ -1006,8 +1024,8 @@ fn tubes(pa: &Painter, r: Rect, warm: f32, drive01: f32, label: &str, t: f64) {
     worn_txt(pa, pos2(r.center().x, r.bottom() + 28.0), Align2::CENTER_CENTER, "VALVES", osw(12.0), CREAM, 3.0);
 }
 
-fn lit_button(ui: &mut egui::Ui, r: Rect, s: &str, on: bool, id: impl std::hash::Hash) -> bool {
-    let resp = ui.interact(r, ui.id().with(("litbtn", id)), Sense::click());
+fn lit_button(ui: &mut egui::Ui, r: Rect, s: &str, on: bool, id: impl std::hash::Hash + std::fmt::Debug) -> bool {
+    let resp = ui.interact(r, ui.scope_id().with(("litbtn", id)), Sense::click());
     let pa = ui.painter();
     let rr = r.translate(vec2(0.0, if on { 2.0 } else { 0.0 }));
     pa.rect_filled(r.translate(vec2(2.0, 3.0)), 3.0, Color32::from_black_alpha(150));
@@ -1024,8 +1042,48 @@ fn lit_button(ui: &mut egui::Ui, r: Rect, s: &str, on: bool, id: impl std::hash:
     resp.clicked()
 }
 
-fn small_key(ui: &mut egui::Ui, r: Rect, s: &str, on: bool, id: impl std::hash::Hash) -> bool {
-    let resp = ui.interact(r, ui.id().with(("key", id)), Sense::click());
+/// Recessed well that lit keys sit in.
+fn bezel(pa: &Painter, r: Rect) {
+    pa.rect_filled(r, 7.0, rgb(0x09, 0x08, 0x07));
+    pa.rect_stroke(r, 7.0, Stroke::new(1.0_f32, Color32::from_black_alpha(220)), StrokeKind::Outside);
+    line(pa, pos2(r.left() + 6.0, r.bottom() + 1.5), pos2(r.right() - 6.0, r.bottom() + 1.5), Color32::from_white_alpha(16), 1.0);
+    vgrad(pa, Rect::from_min_size(r.left_top() + vec2(3.0, 2.0), vec2(r.width() - 6.0, 6.0)), Color32::from_black_alpha(140), Color32::TRANSPARENT);
+}
+
+/// Backlit glass key: smoked when off, amber and glowing when lit.
+fn lit_key(ui: &mut egui::Ui, r: Rect, s: &str, on: bool, id: impl std::hash::Hash + std::fmt::Debug) -> Response {
+    let resp = ui.interact(r, ui.scope_id().with(("litkey", id)), Sense::click());
+    let pa = ui.painter();
+    let down = if on { 1.5 } else if resp.is_pointer_button_down_on() { 1.0 } else { -0.5 };
+    let k = r.translate(vec2(0.0, down));
+    pa.rect_filled(r.translate(vec2(0.0, 2.5)), 4.0, rgb(0x04, 0x03, 0x03));
+    if on {
+        for i in 0..6 {
+            pa.rect_filled(k.expand(2.0 + i as f32 * 2.5), 5.0 + i as f32 * 2.5, Color32::from_rgba_unmultiplied(255, 140, 40, (14 - i * 2) as u8));
+        }
+        pa.rect_filled(k, 4.0, rgb(0xb4, 0x58, 0x12));
+        for i in 0..10 {
+            let t = i as f32 / 10.0;
+            let rr = k.shrink2(vec2(k.width() * 0.46 * t, k.height() * 0.40 * t));
+            pa.rect_filled(rr, 4.0 + 8.0 * t, al(mix_col(rgb(0xe8, 0x86, 0x28), rgb(0xff, 0xe6, 0xb0), t), 0.45));
+        }
+        vgrad(pa, Rect::from_min_size(k.left_top() + vec2(4.0, 3.0), vec2(k.width() - 8.0, k.height() * 0.4)), Color32::from_white_alpha(70), Color32::TRANSPARENT);
+    } else {
+        vgrad(pa, k, rgb(0x2c, 0x28, 0x23), rgb(0x11, 0x0f, 0x0e));
+        vgrad(pa, Rect::from_min_size(k.left_top() + vec2(4.0, 3.0), vec2(k.width() - 8.0, k.height() * 0.4)), Color32::from_white_alpha(if resp.hovered() { 26 } else { 14 }), Color32::TRANSPARENT);
+        line(pa, k.left_top() + vec2(4.0, 0.5), k.right_top() + vec2(-4.0, 0.5), Color32::from_white_alpha(30), 1.0);
+    }
+    pa.rect_stroke(k, 4.0, Stroke::new(1.0_f32, rgb(0x05, 0x04, 0x04)), StrokeKind::Outside);
+    let tc = if on { rgb(0x3a, 0x1c, 0x06) } else if resp.hovered() { al(CREAM, 0.6) } else { al(CREAM, 0.36) };
+    if on {
+        txt(pa, k.center() + vec2(0.0, 1.0), Align2::CENTER_CENTER, s, osw(12.0), Color32::from_rgba_unmultiplied(255, 236, 190, 120), 2.4);
+    }
+    txt(pa, k.center(), Align2::CENTER_CENTER, s, osw(12.0), tc, 2.4);
+    resp
+}
+
+fn small_key(ui: &mut egui::Ui, r: Rect, s: &str, on: bool, id: impl std::hash::Hash + std::fmt::Debug) -> bool {
+    let resp = ui.interact(r, ui.scope_id().with(("key", id)), Sense::click());
     let pa = ui.painter();
     pa.rect_filled(r, 2.0, if on { rgb(0xe9, 0xd9, 0xb0) } else if resp.hovered() { rgb(0x4e, 0x48, 0x40) } else { rgb(0x3e, 0x39, 0x33) });
     pa.rect_stroke(r, 2.0, Stroke::new(1.0_f32, Color32::from_black_alpha(160)), StrokeKind::Inside);
@@ -1081,25 +1139,30 @@ fn analog_face(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnPar
     wordmark(&pa, at(92.0, 92.0), osw(46.0), CREAM, 10.0, true);
     worn_txt(&pa, at(96.0, 128.0), Align2::LEFT_CENTER, "VALVE · TAPE · IRON SATURATOR", osw(11.5), al(CREAM, 0.8), 3.0);
     // preset name on label tape (read-only; the header strip browses)
-    let tape = rc(380.0, 70.0, 240.0, 28.0);
-    pa.rect_filled(tape, 3.0, rgb(0xa3, 0x23, 0x1b));
-    pa.rect_filled(Rect::from_min_size(tape.left_top() + vec2(0.0, 3.0), vec2(tape.width(), 1.0)), 0.0, Color32::from_white_alpha(20));
+    let tape = rc(380.0, 66.0, 240.0, 36.0);
+    bezel(&pa, tape.expand(5.0));
+    vgrad(&pa, tape, rgb(0x30, 0x1b, 0x07), rgb(0x12, 0x0a, 0x03));
+    for i in 0..5 {
+        let t = i as f32 / 5.0;
+        pa.rect_filled(tape.shrink2(vec2(tape.width() * 0.4 * t, tape.height() * 0.3 * t)), 3.0, Color32::from_rgba_unmultiplied(255, 140, 40, 7));
+    }
     let pname = st.presets.current.to_uppercase();
     let pname: String = pname.chars().take(22).collect();
-    txt(&pa, tape.center(), Align2::CENTER_CENTER, &pname, mono(14.0), rgb(0xf4, 0xee, 0xe6), 3.0);
-    worn_txt(&pa, at(500.0, 112.0), Align2::CENTER_CENTER, "PROGRAM", osw(9.5), al(CREAM, 0.6), 3.0);
+    txt(&pa, tape.center(), Align2::CENTER_CENTER, &pname, mono(16.0), Color32::from_rgba_unmultiplied(255, 160, 60, 70), 3.6);
+    txt(&pa, tape.center(), Align2::CENTER_CENTER, &pname, mono(15.0), rgb(0xff, 0xb3, 0x47), 3.0);
+    worn_txt(&pa, at(500.0, 118.0), Align2::CENTER_CENTER, "PROGRAM", osw(9.5), al(CREAM, 0.6), 3.0);
 
-    let mode_r = rc(770.0, 64.0, 60.0, 92.0);
-    if ui.interact(mode_r, ui.id().with("amode"), Sense::click()).clicked() {
+    // FACE: interlocked lit keys (ANALOG is lit on this face)
+    bezel(&pa, rc(700.0, 66.0, 184.0, 54.0));
+    lit_key(ui, rc(707.0, 73.0, 82.0, 40.0), "ANALOG", true, "aface_a");
+    if lit_key(ui, rc(795.0, 73.0, 82.0, 40.0), "DIGITAL", false, "aface_d").clicked() {
         p.analog.store(false, Ordering::Relaxed);
     }
-    worn_txt(&pa, at(800.0, 74.0), Align2::CENTER_CENTER, "DIGITAL", osw(10.5), CREAM, 2.0);
-    worn_txt(&pa, at(800.0, 148.0), Align2::CENTER_CENTER, "ANALOG", osw(10.5), CREAM, 2.0);
-    bat(&pa, at(800.0, 111.0), PI);
+    worn_txt(&pa, at(792.0, 134.0), Align2::CENTER_CENTER, "FACE", osw(9.5), al(CREAM, 0.6), 3.0);
     let on = !p.bypass.value();
-    lamp(&pa, at(880.0, 100.0), rgb(0xff, 0x4a, 0x2a), on && warm > 0.05);
-    worn_txt(&pa, at(880.0, 130.0), Align2::CENTER_CENTER, "POWER", osw(10.5), CREAM, 2.0);
-    if ui.interact(rc(860.0, 84.0, 40.0, 56.0), ui.id().with("apower"), Sense::click()).clicked() {
+    lamp(&pa, at(920.0, 90.0), rgb(0xff, 0x4a, 0x2a), on && warm > 0.05);
+    worn_txt(&pa, at(920.0, 118.0), Align2::CENTER_CENTER, "POWER", osw(10.0), CREAM, 2.0);
+    if ui.interact(rc(898.0, 74.0, 44.0, 54.0), ui.scope_id().with("apower"), Sense::click()).clicked() {
         set_b(setter, &p.bypass, on);
     }
 
@@ -1113,27 +1176,103 @@ fn analog_face(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnPar
     let tl = if ty <= T_POWER && !(ty == T_PRE && p.var.value() == 2) { TYPES[ty as usize].3[p.var.value().clamp(0, 2) as usize] } else { "12AX7" };
     tubes(&pa, rc(388.0, 170.0, 170.0, 170.0), warm, p.drive.value() / 24.0, tl, t);
 
-    // --- TYPE rotary (stepped: drag, scroll, or click a name)
-    let tc = at(690.0, 262.0);
-    let tr = 38.0;
-    worn_txt(&pa, tc + vec2(0.0, -88.0), Align2::CENTER_CENTER, "TYPE", osw(14.0), CREAM, 3.0);
-    for (i, ty_) in TYPES.iter().enumerate() {
-        let a = ((-100.0 + i as f32 * 40.0) - 90.0f32).to_radians();
-        let sel = ty == i as i32;
-        line(&pa, polar(tc, a, tr + 5.0), polar(tc, a, tr + 12.0), if sel { HEAT } else { al(CREAM, 0.8) }, if sel { 2.2 } else { 1.4 });
-        let lp = polar(tc, a, 70.0);
-        let (align, dx) = if a.cos() > 0.3 { (Align2::LEFT_CENTER, 4.0) } else if a.cos() < -0.3 { (Align2::RIGHT_CENTER, -4.0) } else { (Align2::CENTER_CENTER, 0.0) };
-        let lr = txt(&pa, lp + vec2(dx, 0.0), align, ty_.1, osw(12.0), if sel { HEAT } else { al(CREAM, 0.82) }, 1.5);
-        if ui.interact(lr.expand(4.0), ui.id().with(("tname", i)), Sense::click()).clicked() {
-            set_type(setter, p, i as i32);
+    // --- TYPE: pitch wheel + lit window (roll, scroll, click a half or a name)
+    let n = TYPES.len() as i32;
+    let step_px = 22.0;
+    let step_ang = 0.36;
+    worn_txt(&pa, at(703.0, 174.0), Align2::CENTER_CENTER, "TYPE", osw(14.0), CREAM, 3.0);
+    let slot = rc(606.0, 196.0, 46.0, 150.0);
+    let win = rc(664.0, 196.0, 140.0, 150.0);
+    bezel(&pa, slot.expand(3.0));
+    bezel(&pa, win.expand(3.0));
+    let wresp = ui.interact(slot, ui.scope_id().with("awheel"), Sense::click_and_drag());
+    let mut go = 0i32;
+    if wresp.dragged() {
+        st.wheel_acc += wresp.drag_delta().y;
+        while st.wheel_acc > step_px { go += 1; st.wheel_acc -= step_px; }
+        while st.wheel_acc < -step_px { go -= 1; st.wheel_acc += step_px; }
+    } else {
+        st.wheel_acc = 0.0;
+    }
+    if wresp.clicked() {
+        if let Some(pp) = wresp.interact_pointer_pos() {
+            go = if pp.y < slot.center().y { -1 } else { 1 };
         }
     }
-    pa.circle_filled(tc, tr + 2.0, rgb(0x16, 0x13, 0x0f));
-    let before = p.ty.value();
-    chicken(ui, setter, tc, tr, &p.ty, "", CREAM, false, false);
-    if p.ty.value() != before {
-        set_i(setter, &p.var, 0);
+    if wresp.hovered() || ui.rect_contains_pointer(win) {
+        let sc = ui.input(|i| i.events.iter().map(|e| if let egui::Event::MouseWheel { delta, .. } = e { delta.y } else { 0.0 }).sum::<f32>());
+        if sc != 0.0 {
+            go = if sc > 0.0 { -1 } else { 1 };
+        }
     }
+    let at_end = (ty + go < 0 && go < 0) || (ty + go >= n && go > 0);
+    if go != 0 && !at_end {
+        set_type(setter, p, (ty + go).clamp(0, n - 1));
+    }
+    if at_end { st.wheel_acc = st.wheel_acc.clamp(-4.0, 4.0); }
+    let tgt = p.ty.value() as f32 * step_ang + st.wheel_acc / step_px * step_ang;
+    st.wheel_spin += (tgt - st.wheel_spin) * 0.3;
+    // the wheel: a rubber cylinder seen face-on through its slot
+    let cyl = slot.shrink2(vec2(7.0, 6.0));
+    let cp = pa.with_clip_rect(cyl);
+    let (cy, rr) = (cyl.center().y, cyl.height() / 2.0);
+    let half = Rect::from_min_size(cyl.left_top(), vec2(cyl.width(), rr));
+    vgrad(&cp, half, rgb(0x04, 0x04, 0x04), rgb(0x5c, 0x56, 0x4e));
+    vgrad(&cp, half.translate(vec2(0.0, rr)), rgb(0x5c, 0x56, 0x4e), rgb(0x04, 0x04, 0x04));
+    hgrad(&cp, Rect::from_min_size(cyl.left_top(), vec2(8.0, cyl.height())), Color32::from_black_alpha(140), Color32::TRANSPARENT);
+    hgrad(&cp, Rect::from_min_size(cyl.right_top() - vec2(8.0, 0.0), vec2(8.0, cyl.height())), Color32::TRANSPARENT, Color32::from_black_alpha(140));
+    let rib = TAU / 48.0;
+    let mut k = (-PI / 2.0 - st.wheel_spin) / rib;
+    k = k.ceil();
+    loop {
+        let phi = k * rib + st.wheel_spin;
+        if phi > PI / 2.0 { break; }
+        let y = cy + rr * phi.sin();
+        let lum = phi.cos();
+        line(&cp, pos2(cyl.left(), y), pos2(cyl.right(), y), Color32::from_black_alpha((90.0 + 120.0 * lum) as u8), 1.0 + 1.6 * lum);
+        line(&cp, pos2(cyl.left(), y + 1.0 + lum), pos2(cyl.right(), y + 1.0 + lum), Color32::from_white_alpha((22.0 * lum) as u8), 1.0);
+        k += 1.0;
+    }
+    // index stripe printed on the rubber (centred when settled)
+    let off = st.wheel_spin - p.ty.value() as f32 * step_ang;
+    if off.abs() < PI / 2.0 {
+        let y = cy + rr * off.sin();
+        let w = 3.0 + 2.0 * off.cos();
+        pa.with_clip_rect(cyl).rect_filled(Rect::from_center_size(pos2(cyl.center().x, y), vec2(cyl.width(), w)), 0.0, rgb(0xff, 0xb3, 0x47));
+    }
+    for (x, d) in [(slot.left() - 9.0, 1.0f32), (slot.right() + 9.0, -1.0)] {
+        pa.add(Shape::convex_polygon(vec![pos2(x, cy - 4.0), pos2(x + 5.0 * d, cy), pos2(x, cy + 4.0)], al(CREAM, 0.6), Stroke::NONE));
+    }
+    // lit window
+    pa.rect_filled(win, 5.0, rgb(0x0a, 0x08, 0x06));
+    for i in 0..6 {
+        let t = i as f32 / 6.0;
+        pa.rect_filled(win.shrink2(vec2(win.width() * 0.4 * t, win.height() * 0.38 * t)), 5.0, Color32::from_rgba_unmultiplied(255, 140, 40, 6));
+    }
+    let cur = p.ty.value().clamp(0, n - 1);
+    let rail = Rect::from_center_size(win.center() - vec2(0.0, 6.0), vec2(win.width() - 20.0, 34.0));
+    for y in [rail.top(), rail.bottom()] {
+        line(&pa, pos2(rail.left(), y), pos2(rail.right(), y), Color32::from_rgba_unmultiplied(255, 179, 71, 80), 1.0);
+    }
+    for (dy, j) in [(-44.0, cur - 1), (0.0, cur), (44.0, cur + 1)] {
+        if j < 0 || j >= n { continue; }
+        let c = win.center() + vec2(0.0, dy - 6.0);
+        let name = TYPES[j as usize].1;
+        let r = if dy == 0.0 {
+            txt(&pa, c, Align2::CENTER_CENTER, name, osw(20.0), Color32::from_rgba_unmultiplied(255, 160, 60, 60), 3.2);
+            txt(&pa, c, Align2::CENTER_CENTER, name, osw(19.0), rgb(0xff, 0xb3, 0x47), 3.0)
+        } else {
+            txt(&pa, c, Align2::CENTER_CENTER, name, osw(12.5), al(CREAM, 0.3), 2.6)
+        };
+        if dy != 0.0 && ui.interact(r.expand2(vec2(14.0, 8.0)), ui.scope_id().with(("tname", j)), Sense::click()).clicked() {
+            set_type(setter, p, j);
+        }
+    }
+    for i in 0..n {
+        let c = pos2(win.center().x + (i as f32 - (n - 1) as f32 / 2.0) * 11.0, win.bottom() - 12.0);
+        pa.circle_filled(c, 2.6, if i == cur { rgb(0xff, 0xb3, 0x47) } else { rgb(0x3a, 0x35, 0x2e) });
+    }
+    worn_txt(&pa, at(705.0, 364.0), Align2::CENTER_CENTER, "ROLL · SCROLL · CLICK", osw(8.5), al(CREAM, 0.5), 2.5);
 
     // --- VARIANT push-buttons
     worn_txt(&pa, at(882.0, 174.0), Align2::CENTER_CENTER, "VARIANT", osw(14.0), CREAM, 3.0);
@@ -1174,11 +1313,8 @@ fn analog_face(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnPar
     chicken(ui, setter, at(420.0, 468.0), 28.0, &p.depth, "DEPTH", CREAM, false, true);
     let tame_on = p.tame.value();
     chicken(ui, setter, at(560.0, 468.0), 28.0, &p.tamt, "TAME", COOL, !tame_on, true);
-    worn_txt(&pa, at(632.0, 424.0), Align2::CENTER_CENTER, "ON", osw(10.0), CREAM, 2.0);
-    worn_txt(&pa, at(632.0, 512.0), Align2::CENTER_CENTER, "OFF", osw(10.0), CREAM, 2.0);
-    bat(&pa, at(632.0, 468.0), if tame_on { 0.0 } else { PI });
-    lamp(&pa, at(662.0, 468.0), COOL, tame_on);
-    if ui.interact(rc(614.0, 432.0, 40.0, 72.0), ui.id().with("atame"), Sense::click()).clicked() {
+    bezel(&pa, rc(617.0, 444.0, 60.0, 48.0));
+    if lit_key(ui, rc(623.0, 450.0, 48.0, 36.0), "ON", tame_on, "atame").on_hover_text("TAME on / off").clicked() {
         set_b(setter, &p.tame, !tame_on);
     }
     chicken(ui, setter, at(740.0, 468.0), 28.0, &p.mix, "MIX", CREAM, false, true);
@@ -1188,7 +1324,7 @@ fn analog_face(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnPar
     let safe = p.safe.value();
     lamp(&pa, at(110.0, 580.0), rgb(0xff, 0x9a, 0x2a), safe);
     worn_txt(&pa, at(128.0, 580.0), Align2::LEFT_CENTER, "SAFE", osw(11.0), CREAM, 2.0);
-    if ui.interact(rc(100.0, 568.0, 70.0, 24.0), ui.id().with("asafe"), Sense::click()).clicked() {
+    if ui.interact(rc(100.0, 568.0, 70.0, 24.0), ui.scope_id().with("asafe"), Sense::click()).clicked() {
         set_b(setter, &p.safe, !safe);
     }
     worn_txt(&pa, at(200.0, 580.0), Align2::LEFT_CENTER, "OVERSAMPLE", osw(11.0), CREAM, 2.0);
@@ -1200,7 +1336,7 @@ fn analog_face(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnPar
     let auto = p.auto.value();
     lamp(&pa, at(450.0, 580.0), rgb(0xff, 0x9a, 0x2a), auto);
     worn_txt(&pa, at(468.0, 580.0), Align2::LEFT_CENTER, "AUTO GAIN", osw(11.0), CREAM, 2.0);
-    if ui.interact(rc(440.0, 568.0, 110.0, 24.0), ui.id().with("aauto"), Sense::click()).clicked() {
+    if ui.interact(rc(440.0, 568.0, 110.0, 24.0), ui.scope_id().with("aauto"), Sense::click()).clicked() {
         set_b(setter, &p.auto, !auto);
     }
     for (x, name, prm) in [(600.0, "LO", &p.sat_lo), (668.0, "HI", &p.sat_hi)] {
@@ -1225,19 +1361,17 @@ fn analog_face(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnPar
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nih_plug::context::gui::GuiContext;
-    use nih_plug::wrapper::state::PluginState;
-    use nih_plug_egui::egui::{epaint, Event, ImageData, Modifiers, PointerButton, RawInput, TextureId, TextureWrapMode, Vec2};
+    use nice_plug::context::gui::GuiContextInner;
+    use nice_plug::plugin::PluginState;
+    use egui::{epaint, Event, ImageData, Modifiers, PointerButton, RawInput, TextureId, TextureWrapMode, Vec2};
     use std::collections::HashMap;
 
     struct Mock;
-    impl GuiContext for Mock {
+    impl GuiContextInner for Mock {
         fn plugin_api(&self) -> PluginApi {
             PluginApi::Vst3
         }
-        fn request_resize(&self) -> bool {
-            true
-        }
+        fn request_restart(&self) {}
         unsafe fn raw_begin_set_parameter(&self, _p: ParamPtr) {}
         unsafe fn raw_set_parameter_normalized(&self, _p: ParamPtr, _n: f32) {}
         unsafe fn raw_end_set_parameter(&self, _p: ParamPtr) {}
@@ -1261,7 +1395,7 @@ mod tests {
         let mut run = |st: &mut St, ev: Vec<Event>| {
             let raw = RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(WIDTH as f32, HEIGHT as f32))), time: Some(i as f64 * 0.04), events: ev, ..Default::default() };
             i += 1;
-            let _ = ctx.run(raw, |ctx| frame(ctx, &setter, st, &p, &sh));
+            let _ = ctx.run_ui(raw, |ctx| frame(ctx, &setter, st, &p, &sh));
         };
         for analog in [false, true] {
             p.analog.store(analog, Ordering::Relaxed);
@@ -1284,10 +1418,9 @@ mod tests {
         repeat: bool,
     }
     fn apply_delta(texs: &mut HashMap<TextureId, Tex>, out: &egui::FullOutput) {
-        for (id, d) in &out.textures_delta.set {
+        for (id, d) in out.textures_delta.set.iter().flat_map(|(id, ds)| ds.iter().map(move |d| (id, d))) {
             let (w, h, px): (usize, usize, Vec<[f32; 4]>) = match &d.image {
                 ImageData::Color(c) => (c.size[0], c.size[1], c.pixels.iter().map(|p| [p.r() as f32 / 255.0, p.g() as f32 / 255.0, p.b() as f32 / 255.0, p.a() as f32 / 255.0]).collect()),
-                ImageData::Font(f) => (f.size[0], f.size[1], f.srgba_pixels(None).map(|p| [p.r() as f32 / 255.0, p.g() as f32 / 255.0, p.b() as f32 / 255.0, p.a() as f32 / 255.0]).collect()),
             };
             let repeat = d.options.wrap_mode == TextureWrapMode::Repeat;
             if let Some(pos) = d.pos {
@@ -1389,7 +1522,7 @@ mod tests {
             p.analog.store(*analog, Ordering::Relaxed);
             let mut last = None;
             for f in 0..4 {
-                last = Some(ctx.run(raw(n * 10 + f, vec![]), |c| frame(c, &setter, &mut st, p, &sh)));
+                last = Some(ctx.run_ui(raw(n * 10 + f, vec![]), |c| frame(c, &setter, &mut st, p, &sh)));
                 if f < 3 {
                     apply_delta(&mut texs, last.as_ref().unwrap());
                 }

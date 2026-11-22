@@ -4,13 +4,15 @@
 //!    -> AUTO GAIN -> MIX with the dry -> OUTPUT -> bypass ramp -> SAFE ceiling.
 //! TAME DELTA plays only what TAME removes. Latency = the oversampler's only.
 
-use nih_plug::prelude::*;
+use nice_plug::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 mod analyzer;
 mod awk_ui;
+
 mod editor;
+mod nice_app;
 mod oversample;
 pub mod params;
 mod presets;
@@ -378,6 +380,7 @@ impl Plugin for Kiln {
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout { main_input_channels: NonZeroU32::new(2), main_output_channels: NonZeroU32::new(2), ..AudioIOLayout::const_default() }];
     const MIDI_INPUT: MidiConfig = MidiConfig::None;
     const SAMPLE_ACCURATE_AUTOMATION: bool = false;
+    type Editor = crate::nice_app::AwkEditor;
     type SysExMessage = ();
     type BackgroundTask = ();
 
@@ -385,11 +388,11 @@ impl Plugin for Kiln {
         self.params.clone()
     }
 
-    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Self::Editor> {
         editor::create(self.params.clone(), self.shared.clone())
     }
 
-    fn initialize(&mut self, _layout: &AudioIOLayout, cfg: &BufferConfig, ctx: &mut impl InitContext<Self>) -> bool {
+    fn activate(&mut self, _layout: &AudioIOLayout, cfg: &BufferConfig, ctx: &mut impl ActivateContext<Self>) -> bool {
         self.prepare(cfg.sample_rate);
         ctx.set_latency_samples(self.lat as u32);
         true
@@ -440,5 +443,5 @@ impl Vst3Plugin for Kiln {
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[Vst3SubCategory::Fx, Vst3SubCategory::Distortion];
 }
 
-nih_export_clap!(Kiln);
-nih_export_vst3!(Kiln);
+nice_export_clap!(Kiln);
+nice_export_vst3!(Kiln);

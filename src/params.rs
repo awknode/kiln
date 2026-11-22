@@ -1,8 +1,8 @@
 //! Kiln parameters. Ids are short and fixed: presets and sessions depend on them.
 
 use crate::awk_ui;
-use nih_plug::prelude::*;
-use nih_plug_egui::EguiState;
+use nice_plug::prelude::*;
+use nice_plug_egui::EguiEditorState;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -58,8 +58,8 @@ fn hz(name: &str, def: f32, min: f32, max: f32) -> FloatParam {
 
 #[derive(Params)]
 pub struct KilnParams {
-    #[persist = "editor-state"]
-    pub editor_state: Arc<EguiState>,
+    /// window size (hosts keep track of it; not persisted)
+    pub editor_state: Arc<EguiEditorState>,
     /// DIGITAL (false) or ANALOG (true) face. Saved with the session, not in presets.
     #[persist = "analog"]
     pub analog: Arc<AtomicBool>,
@@ -181,7 +181,7 @@ fn steps(name: &str, def: i32, list: &'static [(&'static str, f32)]) -> IntParam
 impl Default for KilnParams {
     fn default() -> Self {
         Self {
-            editor_state: EguiState::from_size(crate::editor::WIDTH, crate::editor::HEIGHT),
+            editor_state: EguiEditorState::from_size(nice_plug::editor::dpi::LogicalSize::new((crate::editor::WIDTH) as f64, (crate::editor::HEIGHT) as f64), 1.0),
             analog: Arc::new(AtomicBool::new(false)),
             mix: awk_ui::mix_param(),
             bypass: awk_ui::bypass_param(),

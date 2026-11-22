@@ -2,7 +2,7 @@
 //! names real params with legal values; with PRESET_OUT=dir it also writes the
 //! .awkp files there (anything a preset doesn't mention loads at its default).
 use kiln::KilnParams;
-use nih_plug::prelude::*;
+use nice_plug::prelude::*;
 use serde_json::{json, Map, Value};
 
 type P = &'static [(&'static str, f64)];
@@ -80,7 +80,7 @@ fn factory_presets_are_valid() {
     let dir = std::env::var("PRESET_OUT").ok();
     for (name, over) in PRESETS {
         let v = build(&params, over);
-        let _: nih_plug::wrapper::state::PluginState = serde_json::from_value(v.clone()).unwrap();
+        let _: nice_plug::plugin::PluginState = serde_json::from_value(v.clone()).unwrap();
         if let Some(d) = &dir {
             std::fs::create_dir_all(d).unwrap();
             std::fs::write(format!("{d}/{name}.awkp"), serde_json::to_string_pretty(&v).unwrap()).unwrap();
