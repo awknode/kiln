@@ -248,9 +248,8 @@ impl Sat {
         let f = self.factor;
         self.ch = [Chan::new(f), Chan::new(f)];
         self.env = 0.0;
-        self.ms_in = 0.0;
-        self.ms_out = 0.0;
-        self.ag = 1.0;
+        // AUTO GAIN (ms_in, ms_out, ag) is kept: hosts reset on play/stop, and relearning
+        // from unity would make the first hit after play sound different from the rest
         self.last = None;
     }
 
@@ -419,8 +418,12 @@ impl Sat {
             }
         }
         // AUTO GAIN: match the wet's loudness to the input's
-        self.ms_in += self.ag_c * (0.5 * (l * l + r * r) - self.ms_in);
-        self.ms_out += self.ag_c * (0.5 * (out[0] * out[0] + out[1] * out[1]) - self.ms_out);
+        // (frozen while the input is silent, so tails and gaps don't swing the gain)
+        let p_in = 0.5 * (l * l + r * r);
+        if p_in > 1e-8 {
+            self.ms_in += self.ag_c * (p_in - self.ms_in);
+            self.ms_out += self.ag_c * (0.5 * (out[0] * out[0] + out[1] * out[1]) - self.ms_out);
+        }
         let target = if auto {
             if self.ms_in > 1e-8 && self.ms_out > 1e-10 {
                 (self.ms_in / self.ms_out).sqrt().clamp(0.03, 4.0)
