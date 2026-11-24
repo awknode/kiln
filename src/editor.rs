@@ -59,7 +59,7 @@ struct St {
 
 fn new_st(preset_dir: &'static str) -> St {
     St {
-        presets: PresetBar::new(preset_dir),
+        presets: PresetBar::new(preset_dir).with_dice(&["gmix", "safe", "os", "out", "auto", "delta", "fb", "solo1", "solo2", "solo3", "solo4", "solo5", "solo6", "byp1", "byp2", "byp3", "byp4", "byp5", "byp6"]),
         skin: Skin::new(Look::Blackface, HEAT, "KIL", env!("CARGO_PKG_VERSION"), ""),
         an_in: Analyzer::default(),
         an_out: Analyzer::default(),
