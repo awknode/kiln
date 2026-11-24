@@ -25,7 +25,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 pub const WIDTH: u32 = 1000;
-pub const HEIGHT: u32 = 660;
+pub const HEIGHT: u32 = 800;
 const HEAT: Color32 = rgb(0xff, 0xb5, 0x47);
 const COOL: Color32 = rgb(0x7f, 0xe0, 0xd0);
 const CREAM: Color32 = rgb(0xea, 0xdf, 0xc6);
@@ -82,6 +82,7 @@ fn new_st(preset_dir: &'static str) -> St {
 pub(crate) fn create(params: Arc<KilnParams>, shared: Arc<Shared>) -> Option<crate::nice_app::AwkEditor> {
     let state = params.editor_state.clone();
     let st = new_st("Kiln");
+    crate::presets::apply_scale(&state, &params.ui_scale);
     create_egui_editor(state, nice_plug_egui::RepaintNotifier::new(), nice_plug_egui::EguiNiceSettings::default(), crate::nice_app::AwkApp::new(fonts, {
         let mut __st = st;
         Box::new(move |ctx: &mut egui::Ui, setter: &ParamSetter| {
@@ -186,7 +187,171 @@ fn set_band_type(setter: &ParamSetter, p: &KilnParams, b: usize, t: i32) {
     }
 }
 fn nbands(p: &KilnParams) -> usize {
-    p.bands.value().clamp(1, 3) as usize
+    p.bands.value().clamp(1, MAXB as i32) as usize
+}
+fn set_f(setter: &ParamSetter, p: &FloatParam, v: f32) {
+    setter.begin_set_parameter(p);
+    setter.set_parameter(p, v);
+    setter.end_set_parameter(p);
+}
+/// Change the band count; a new band splits the widest band in two (in log frequency).
+fn set_bands(setter: &ParamSetter, p: &KilnParams, n: usize) {
+    let mut have = nbands(p);
+    while have < n {
+        let mut pts: Vec<f32> = p.splits().iter().take(have - 1).map(|s| s.value()).collect();
+        pts.push(30.0);
+        pts.push(16000.0);
+        pts.sort_by(|a, b| a.total_cmp(b));
+        let (mut best, mut at) = (0.0f32, 1000.0f32);
+        for w in pts.windows(2) {
+            let g = (w[1] / w[0]).ln();
+            if g > best {
+                best = g;
+                at = (w[0] * w[1]).sqrt();
+            }
+        }
+        set_f(setter, p.splits()[have - 1], at);
+        have += 1;
+    }
+    set_i(setter, &p.bands, n as i32);
+}
+/// Thin arc outside a knob showing where modulation has it right now.
+fn mod_ring(pa: &Painter, c: Pos2, r: f32, norm: f32, off: f32) {
+    if off.abs() < 0.004 {
+        return;
+    }
+    let (a0, a1) = (norm.clamp(0.0, 1.0), (norm + off).clamp(0.0, 1.0));
+    let n = 24;
+    let pts: Vec<Pos2> = (0..=n).map(|i| a0 + (a1 - a0) * i as f32 / n as f32).map(|v| c + egui::Vec2::angled(ang(v)) * (r + 5.0)).collect();
+    pa.add(Shape::line(pts, Stroke::new(2.0_f32, COOL)));
+    pa.circle_filled(c + egui::Vec2::angled(ang(a1)) * (r + 5.0), 2.5, COOL);
+}
+fn modv(sh: &Shared, b: usize, what: usize) -> f32 {
+    get(&sh.modv[(b * 5 + what).min(N_TGT - 1)])
+}
+fn cycle(setter: &ParamSetter, prm: &IntParam, resp: &Response, lo: i32, hi: i32) {
+    let v = prm.value();
+    if resp.clicked() {
+        set_i(setter, prm, if v >= hi { lo } else { v + 1 });
+    } else if resp.secondary_clicked() {
+        set_i(setter, prm, if v <= lo { hi } else { v - 1 });
+    }
+}
+
+/// 0.4: the selected band's own DYNAMICS / TILT / FEEDBACK / FREQ / MIX / LEVEL.
+fn band_panel(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnParams, sh: &Shared, r: Rect) {
+    let pa = ui.painter().clone();
+    let b = st.band;
+    let nb = nbands(p);
+    let (bty, .., bbyp) = p.band(b);
+    let title = if nb > 1 { format!("BAND {} · {}", b + 1, TYPES[bty.value().clamp(0, 6) as usize].1) } else { "CHARACTER".to_string() };
+    st.skin.panel(&pa, r, &title, "");
+    let x = &p.bx[b];
+    let dim = bbyp.value();
+    let cy = r.top() + 56.0;
+    let ks: [(&str, &FloatParam, bool, usize, f32); 9] = [
+        ("DYN", &x.dynamics, true, 3, 0.5),
+        ("BASS", &x.bass, true, 99, 0.0),
+        ("MID", &x.mid, true, 99, 0.0),
+        ("TREBLE", &x.treble, true, 99, 0.0),
+        ("PRES", &x.presence, true, 99, 0.0),
+        ("FDBK", &x.fb, false, 4, 1.0),
+        ("FREQ", &x.fb_freq, false, 99, 0.0),
+        ("MIX", &x.mix, false, 2, 1.0),
+        ("LEVEL", &x.level, true, 99, 0.0),
+    ];
+    let step = (r.width() - 24.0) / 9.0;
+    for (i, (name, prm, bip, what, k)) in ks.into_iter().enumerate() {
+        let c = pos2(r.left() + 12.0 + step * (i as f32 + 0.5), cy);
+        let fdim = dim || (name == "FREQ" && x.fb.value() <= 0.0 && modv(sh, b, 4) == 0.0);
+        st.skin.knob(ui, setter, c, 16.0, name, prm, false, bip, fdim);
+        if what < 99 {
+            mod_ring(&pa, c, 16.0, prm.unmodulated_normalized_value(), modv(sh, b, what) * k);
+        }
+    }
+    let hint = match () {
+        _ if x.dynamics.value() > 0.02 => "+ DYN compresses: loud and quiet move closer (level holds)",
+        _ if x.dynamics.value() < -0.02 => "- DYN expands: more punch, quieter tails (level holds)",
+        _ if x.fb.value() > 0.0 => "FDBK: a comb tuned to FREQ · low FREQ = body, high FREQ = ring",
+        _ => "BASS · MID · TREBLE · PRES are after the drive, ±24 dB",
+    };
+    txt(&pa, pos2(r.left() + 14.0, r.bottom() - 8.0), Align2::LEFT_CENTER, hint, mono(8.5), st.skin.text_faint(), 0.5);
+}
+
+/// 0.4: two LFOs + an envelope follower, into 4 slots (SOURCE -> BAND · WHAT by AMOUNT).
+fn mod_panel(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnParams, sh: &Shared, r: Rect) {
+    let pa = ui.painter().clone();
+    st.skin.panel(&pa, r, "MODULATION", "");
+    let skin = &st.skin;
+    let x0 = r.left();
+    let meter = |pa: &Painter, c: Pos2, v: f32, bip: bool| {
+        let w = 26.0;
+        let bar = Rect::from_center_size(c, vec2(w, 5.0));
+        pa.rect_filled(bar, 2.0, Color32::from_black_alpha(140));
+        let (a, b): (f32, f32) = if bip { (0.5, 0.5 + 0.5 * v.clamp(-1.0, 1.0)) } else { (0.0, v.clamp(0.0, 1.0)) };
+        let (l, rr) = (bar.left() + w * a.min(b), bar.left() + w * a.max(b));
+        pa.rect_filled(Rect::from_min_max(pos2(l, bar.top()), pos2(rr.max(l + 1.0), bar.bottom())), 2.0, COOL);
+    };
+    let lfos = [(&p.l1_rate, &p.l1_sync, &p.l1_div, &p.l1_shape, "LFO 1"), (&p.l2_rate, &p.l2_sync, &p.l2_div, &p.l2_shape, "LFO 2")];
+    for (i, (rate, sync, div, shape, name)) in lfos.into_iter().enumerate() {
+        let y = r.top() + 44.0 + i as f32 * 28.0;
+        txt(&pa, pos2(x0 + 14.0, y), Align2::LEFT_CENTER, name, mono(9.5), CREAM, 1.0);
+        meter(&pa, pos2(x0 + 68.0, y), get(&sh.lfo[i]), true);
+        if sync.value() {
+            let resp = skin.chip(ui, Rect::from_min_size(pos2(x0 + 88.0, y - 9.0), vec2(56.0, 18.0)), LFO_DIVS[div.value().clamp(0, 8) as usize].0, true, ("ldiv", i)).on_hover_text("Length (click / right-click)");
+            cycle(setter, div, &resp, 0, LFO_DIVS.len() as i32 - 1);
+        } else {
+            let c = pos2(x0 + 98.0, y);
+            skin.mini_knob(ui, setter, c, 8.0, rate);
+            txt(&pa, pos2(c.x + 12.0, y), Align2::LEFT_CENTER, format!("{:.2}", rate.value()), mono(9.0), skin.text_faint(), 0.0);
+        }
+        if skin.chip(ui, Rect::from_min_size(pos2(x0 + 150.0, y - 9.0), vec2(40.0, 18.0)), "SYNC", sync.value(), ("lsync", i)).on_hover_text("Lock to the host tempo").clicked() {
+            set_b(setter, sync, !sync.value());
+        }
+        let sh_name = ["SIN", "TRI", "SAW", "SQR", "RND"][shape.value().clamp(0, 4) as usize];
+        let resp = skin.chip(ui, Rect::from_min_size(pos2(x0 + 194.0, y - 9.0), vec2(38.0, 18.0)), sh_name, false, ("lshape", i)).on_hover_text("Shape (click / right-click)");
+        cycle(setter, shape, &resp, 0, 4);
+    }
+    {
+        let y = r.top() + 100.0;
+        txt(&pa, pos2(x0 + 14.0, y), Align2::LEFT_CENTER, "ENV", mono(9.5), CREAM, 1.0);
+        let e = get(&sh.env);
+        meter(&pa, pos2(x0 + 68.0, y), ((20.0 * (e + 1e-9).log10() + 60.0) / 60.0).clamp(0.0, 1.0), false);
+        for (k, (prm, nm)) in [(&p.env_att, "A"), (&p.env_rel, "R")].into_iter().enumerate() {
+            let c = pos2(x0 + 98.0 + k as f32 * 72.0, y);
+            skin.mini_knob(ui, setter, c, 8.0, prm);
+            txt(&pa, pos2(c.x + 12.0, y), Align2::LEFT_CENTER, format!("{nm} {:.0}", prm.value()), mono(9.0), skin.text_faint(), 0.0);
+        }
+    }
+    line(&pa, pos2(x0 + 242.0, r.top() + 32.0), pos2(x0 + 242.0, r.bottom() - 10.0), Color32::from_white_alpha(14), 1.0);
+    let nb = nbands(p);
+    for (i, m) in p.ms.iter().enumerate() {
+        let y = r.top() + 40.0 + i as f32 * 23.0;
+        let sx = x0 + 252.0;
+        let src = m.src.value();
+        let resp = skin.chip(ui, Rect::from_min_size(pos2(sx, y - 9.0), vec2(46.0, 18.0)), MOD_SRCS[src.clamp(0, 3) as usize], src > 0, ("msrc", i)).on_hover_text("Source (click / right-click)");
+        cycle(setter, &m.src, &resp, 0, 3);
+        let on = src > 0;
+        let tg = m.target.value().clamp(0, N_TGT as i32 - 1);
+        let (tb, tw) = (tg / 5, tg % 5);
+        txt(&pa, pos2(sx + 52.0, y), Align2::LEFT_CENTER, ">", mono(10.0), skin.text_faint(), 0.0);
+        let rb = skin.chip(ui, Rect::from_min_size(pos2(sx + 64.0, y - 9.0), vec2(28.0, 18.0)), BAND_NAMES[tb as usize], false, ("mtb", i)).on_hover_text("Band (click / right-click)");
+        let top = nb as i32 - 1;
+        if rb.clicked() {
+            set_i(setter, &m.target, (if tb >= top { 0 } else { tb + 1 }) * 5 + tw);
+        } else if rb.secondary_clicked() {
+            set_i(setter, &m.target, (if tb <= 0 { top } else { tb - 1 }) * 5 + tw);
+        }
+        let rw = skin.chip(ui, Rect::from_min_size(pos2(sx + 96.0, y - 9.0), vec2(40.0, 18.0)), MOD_WHAT[tw as usize], false, ("mtw", i)).on_hover_text("What it moves (click / right-click)");
+        if rw.clicked() {
+            set_i(setter, &m.target, tb * 5 + (tw + 1) % 5);
+        } else if rw.secondary_clicked() {
+            set_i(setter, &m.target, tb * 5 + (tw + 4) % 5);
+        }
+        let c = pos2(sx + 150.0, y);
+        skin.mini_knob(ui, setter, c, 8.0, &m.amount);
+        txt(&pa, pos2(c.x + 12.0, y), Align2::LEFT_CENTER, format!("{:+.0}%", m.amount.value() * 100.0), mono(9.0), if on && tb < nb as i32 { COOL } else { skin.text_faint() }, 0.0);
+    }
 }
 fn eq_set(p: &KilnParams) -> crate::sat::EqSet {
     crate::sat::EqSet { hpf: crate::sat::EQ_HPF_HZ(p.eq_hpf.value()), lf: EQ_LF[p.eq_lf.value().clamp(0, 3) as usize].1, lg: p.eq_lg.value(), mf: EQ_MF[p.eq_mf.value().clamp(0, 5) as usize].1, mg: p.eq_mg.value(), hg: p.eq_hg.value() }
@@ -233,7 +398,7 @@ fn frame(root: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnParams,
             digital_face(ui, setter, st, p, sh, o);
         }
         // Header last so its dropdown draws over the faces.
-        let _ = st.presets.strip(ui, setter, p, whole, &st.skin, &p.mix, &p.bypass);
+        let _ = st.presets.strip(ui, setter, p, whole, &st.skin, &p.mix, &p.bypass, &p.ui_scale);
         // The kit draws "KIL" in the header; finish the wordmark with the reversed N
         // (same place and font the kit uses for the name).
         let pa = ui.painter();
@@ -322,7 +487,7 @@ fn digital_face(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnPa
     curve_box(ui, setter, st, p, &pa, rc(760.0, 86.0, 222.0, 236.0));
 
     // Type tiles (for the selected band)
-    let tw = (964.0 - 5.0 * 8.0) / 6.0;
+    let tw = (964.0 - (TYPES.len() - 1) as f32 * 8.0) / TYPES.len() as f32;
     let b = st.band;
     let (bty, bvar, bdrive, bcolor, bsolo, bbyp) = p.band(b);
     let cur = bty.value();
@@ -332,7 +497,7 @@ fn digital_face(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnPa
         let on = cur == i as i32;
         pa.rect_filled(r, 3.0, if on { rgb(0x2b, 0x24, 0x1b) } else if resp.hovered() { rgb(0x1c, 0x18, 0x13) } else { rgb(0x14, 0x11, 0x0e) });
         pa.rect_stroke(r, 3.0, Stroke::new(if on { 1.5_f32 } else { 1.0_f32 }, if on { HEAT } else { rgb(0x2e, 0x27, 0x20) }), StrokeKind::Inside);
-        txt(&pa, r.left_top() + vec2(12.0, 8.0), Align2::LEFT_TOP, ty.0, labb(16.0), if on { rgb(0xff, 0xf6, 0xe8) } else { rgb(0xb8, 0xad, 0x9f) }, 1.5);
+        txt(&pa, r.left_top() + vec2(12.0, 8.0), Align2::LEFT_TOP, ty.0, labb(if ty.0.len() > 10 { 13.5 } else { 16.0 }), if on { rgb(0xff, 0xf6, 0xe8) } else { rgb(0xb8, 0xad, 0x9f) }, 1.5);
         txt(&pa, r.left_top() + vec2(12.0, 30.0), Align2::LEFT_TOP, ty.2, lab(12.0), if on { rgb(0xcd, 0xbf, 0xa9) } else { rgb(0x7d, 0x72, 0x66) }, 0.5);
         // tiny curve glyph
         let g = sat::curve_points(i as i32, 0, 0.4, 9.0, 24);
@@ -345,18 +510,18 @@ fn digital_face(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnPa
     }
     // Variants
     st.skin.small(&pa, at(18.0, 405.0), Align2::LEFT_CENTER, "VARIANT", st.skin.text_dim());
-    let vars = TYPES[cur.clamp(0, 5) as usize].3;
+    let vars = TYPES[cur.clamp(0, 6) as usize].3;
     for (i, v) in vars.iter().enumerate() {
         if st.skin.chip(ui, rc(82.0 + i as f32 * 96.0, 396.0, 88.0, 18.0), v, bvar.value() == i as i32, ("var", i)).clicked() {
             set_i(setter, bvar, i as i32);
         }
     }
     // 0.2: how many bands
-    st.skin.small(&pa, at(388.0, 405.0), Align2::LEFT_CENTER, "BANDS", st.skin.text_dim());
+    st.skin.small(&pa, at(374.0, 405.0), Align2::LEFT_CENTER, "BANDS", st.skin.text_dim());
     let nb = nbands(p);
-    for n in 1..=3usize {
-        if st.skin.chip(ui, rc(432.0 + (n - 1) as f32 * 28.0, 396.0, 24.0, 18.0), &n.to_string(), nb == n, ("bands", n)).on_hover_text("Split the saturation into bands, each with its own type and drive").clicked() {
-            set_i(setter, &p.bands, n as i32);
+    for n in 1..=MAXB {
+        if st.skin.chip(ui, rc(416.0 + (n - 1) as f32 * 23.0, 396.0, 20.0, 18.0), &n.to_string(), nb == n, ("bands", n)).on_hover_text("Split the saturation into bands, each with its own type and drive").clicked() {
+            set_bands(setter, p, n);
         }
     }
     for (k, (x, name, prm)) in [(560.0, "CLEAN LOWS", &p.sat_lo), (780.0, "CLEAN HIGHS", &p.sat_hi)].into_iter().enumerate() {
@@ -372,15 +537,16 @@ fn digital_face(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnPa
     st.skin.panel(&pa, rc(642.0, 424.0, 258.0, 196.0), "TAME", "");
     st.skin.panel(&pa, rc(912.0, 424.0, 70.0, 196.0), "", "");
     let skin = &st.skin;
-    let ci = cur.clamp(0, 5) as usize;
+    let ci = cur.clamp(0, 6) as usize;
     skin.knob(ui, setter, at(92.0, 516.0), 32.0, "DRIVE", bdrive, true, false, bbyp.value());
+    mod_ring(&pa, at(92.0, 516.0), 32.0, bdrive.unmodulated_normalized_value(), modv(sh, b, 0));
     skin.knob(ui, setter, at(205.0, 518.0), 22.0, "COLOR", bcolor, false, false, bbyp.value());
     // 0.2: band tabs + SOLO / BYPASS
     let mut new_band = None;
     if nb > 1 {
         for i in 0..nb {
-            let lbl = BAND_NAMES[if nb == 2 && i == 1 { 2 } else { i }];
-            if skin.chip(ui, rc(430.0 + i as f32 * 62.0, 431.0, 58.0, 18.0), lbl, b == i, ("btab", i)).on_hover_text("Edit this band").clicked() {
+            let lbl = BAND_NAMES[i];
+            if skin.chip(ui, rc(624.0 - (nb - i) as f32 * 36.0, 431.0, 32.0, 18.0), lbl, b == i, ("btab", i)).on_hover_text("Edit this band").clicked() {
                 new_band = Some(i);
             }
         }
@@ -413,14 +579,25 @@ fn digital_face(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnPa
     st.skin.meter(&pa, 922.0 + o.x, 460.0 + o.y, 126.0, "IN", m.db(0), m.db(1), Side::None, "in");
     st.skin.meter(&pa, 952.0 + o.x, 460.0 + o.y, 126.0, "OUT", m.db(2), m.db(3), Side::None, "out");
 
+    // 0.4: the band's own controls + modulation
+    band_panel(ui, setter, st, p, sh, rc(18.0, 630.0, 500.0, 132.0));
+    mod_panel(ui, setter, st, p, sh, rc(530.0, 630.0, 452.0, 132.0));
+
     // Footer
-    let foot = rc(0.0, 630.0, 1000.0, 30.0);
+    let foot = rc(0.0, 770.0, 1000.0, 30.0);
     st.skin.footer(&pa, foot, 0.0);
     st.skin.os_selector(ui, setter, pos2(foot.left() + 16.0, foot.center().y - 8.5), &p.os, 0.7);
     st.skin.safe_chip(ui, setter, Rect::from_center_size(pos2(foot.left() + 430.0, foot.center().y), vec2(104.0, 18.0)), &p.safe, sh.meters.db(4));
     let ag = get(&sh.ag_db);
     let agl = if p.auto.value() { format!("AUTO GAIN {:+.1}", ag) } else { "AUTO GAIN OFF".into() };
     st.skin.chip_param(ui, setter, Rect::from_center_size(pos2(foot.left() + 556.0, foot.center().y), vec2(132.0, 18.0)), &p.auto, (&agl, &agl));
+    let lin = p.phase.value() == 1;
+    if st.skin.chip(ui, Rect::from_center_size(pos2(foot.left() + 720.0, foot.center().y), vec2(150.0, 18.0)), if lin { "PHASE · LINEAR" } else { "PHASE · NATURAL" }, lin, "phase")
+        .on_hover_text("How the bands and CLEAN LOWS / HIGHS are split.\nNATURAL: zero latency, analog-style phase.\nLINEAR: no phase shift at all (tight kicks, clean crossovers), adds about 3072 samples of latency.")
+        .clicked()
+    {
+        set_i(setter, &p.phase, if lin { 0 } else { 1 });
+    }
     if let Some(b) = new_band {
         st.band = b;
     }
@@ -583,9 +760,11 @@ fn spectrum(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnParams
     // 0.2: band splits (drag the lines); click a band's name to edit it
     let nb = nbands(p);
     if nb > 1 {
+        let mut sorted: Vec<f32> = p.splits().iter().take(nb - 1).map(|s| s.value()).collect();
+        sorted.sort_by(|a, b| a.total_cmp(b));
         let mut edges = vec![x0];
-        for prm in [&p.x1, &p.x2].into_iter().take(nb - 1) {
-            edges.push(mapx(fu(prm.value())));
+        for f in sorted {
+            edges.push(mapx(fu(f.clamp(20.0, 20000.0))));
         }
         edges.push(x1);
         for bi in 0..nb {
@@ -599,12 +778,13 @@ fn spectrum(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnParams
             if sel {
                 pa.rect_filled(Rect::from_min_max(pos2(el, top), pos2(er, bot)), 0.0, al(HEAT, 0.025));
             }
-            let name = BAND_NAMES[if nb == 2 && bi == 1 { 2 } else { bi }];
+            let name = BAND_NAMES[bi];
             let (bt, _, _, _, _, bb) = p.band(bi);
-            let what = if bb.value() { "CLEAN" } else { TYPES[bt.value().clamp(0, 5) as usize].1 };
-            txt(&pa, pos2(br.center().x, bot - 11.0), Align2::CENTER_CENTER, format!("{name} · {what}"), mono(9.0), al(if sel { HEAT } else { CREAM }, if sel { 0.95 } else { 0.5 }), 1.5);
+            let what = if bb.value() { "CLEAN" } else { TYPES[bt.value().clamp(0, 6) as usize].1 };
+            let s = if er - el > 96.0 { format!("{name} · {what}") } else { name.to_string() };
+            txt(&pa, pos2(br.center().x, bot - 11.0), Align2::CENTER_CENTER, s, mono(9.0), al(if sel { HEAT } else { CREAM }, if sel { 0.95 } else { 0.5 }), 1.5);
         }
-        for (k, prm) in [&p.x1, &p.x2].into_iter().take(nb - 1).enumerate() {
+        for (k, prm) in p.splits().into_iter().take(nb - 1).enumerate() {
             let x = mapx(fu(prm.value()));
             let my = (top + bot) * 0.5;
             let hr = Rect::from_min_max(pos2(x - 7.0, my), pos2(x + 7.0, bot - 24.0));
@@ -1101,11 +1281,11 @@ fn analog_face(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnPar
     }
     let pa = ui.painter().clone();
     // rack behind, the unit, the unit below
-    pa.rect_filled(rc(0.0, 44.0, 1000.0, 616.0), 0.0, rgb(0x0a, 0x09, 0x08));
+    pa.rect_filled(rc(0.0, 44.0, 1000.0, 756.0), 0.0, rgb(0x0a, 0x09, 0x08));
     for x in [0.0, 960.0] {
-        hgrad(&pa, rc(x, 44.0, 40.0, 616.0), rgb(0x3a, 0x38, 0x33), rgb(0x2a, 0x29, 0x25));
+        hgrad(&pa, rc(x, 44.0, 40.0, 756.0), rgb(0x3a, 0x38, 0x33), rgb(0x2a, 0x29, 0x25));
         let mut y = 50.0;
-        while y < 660.0 {
+        while y < 800.0 {
             pa.rect_filled(rc(x + 15.0, y, 10.0, 8.0), 1.5, rgb(0x0b, 0x0b, 0x0a));
             y += 22.0;
         }
@@ -1119,10 +1299,33 @@ fn analog_face(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnPar
     }
     pa.rect_filled(Rect::from_min_size(face.left_top(), vec2(face.width(), 1.0)), 0.0, Color32::from_white_alpha(20));
     pa.rect_filled(Rect::from_min_size(face.left_bottom(), vec2(face.width(), 1.0)), 0.0, Color32::from_black_alpha(160));
-    let below = rc(8.0, 630.0, 984.0, 30.0);
-    pa.rect_filled(below, 0.0, rgb(0x2e, 0x3a, 0x34));
-    pa.rect_filled(Rect::from_min_size(below.left_top(), vec2(below.width(), 1.0)), 0.0, Color32::from_white_alpha(20));
-    worn_txt(&pa, below.center() + vec2(0.0, 2.0), Align2::CENTER_CENTER, "PARAMETRIC  ·  EQ-4", osw(11.0), rgb(0xc9, 0xc3, 0xb6), 3.0);
+    // the companion unit below: the selected band's own controls
+    let below = rc(8.0, 630.0, 984.0, 162.0);
+    for i in 0..6 {
+        pa.rect_filled(below.expand(i as f32 * 2.0).translate(vec2(0.0, 3.0)), 2.0 + i as f32, Color32::from_black_alpha((50 - i * 7) as u8));
+    }
+    vgrad(&pa, below, rgb(0x34, 0x41, 0x3a), rgb(0x26, 0x30, 0x2b));
+    pa.rect_filled(Rect::from_min_size(below.left_top(), vec2(below.width(), 1.0)), 0.0, Color32::from_white_alpha(24));
+    pa.rect_filled(Rect::from_min_size(below.left_bottom(), vec2(below.width(), 1.0)), 0.0, Color32::from_black_alpha(160));
+    for (x, y, rot) in [(26.0, 650.0, 0.6), (26.0, 772.0, 1.7), (974.0, 650.0, 2.4), (974.0, 772.0, 0.2)] {
+        screw(&pa, at(x, y), rot);
+    }
+    worn_txt(&pa, at(64.0, 654.0), Align2::LEFT_CENTER, "BAND SHAPER  ·  BS-6", osw(12.0), rgb(0xc9, 0xc3, 0xb6), 3.0);
+    {
+        let nb = nbands(p);
+        let b = st.band.min(nb - 1);
+        for i in 0..nb {
+            if small_key(ui, rc(64.0 + i as f32 * 34.0, 676.0, 28.0, 18.0), BAND_NAMES[i], b == i, ("abs", i)) {
+                st.band = i;
+            }
+        }
+        let (bty, ..) = p.band(b);
+        worn_txt(&pa, at(64.0, 716.0), Align2::LEFT_CENTER, TYPES[bty.value().clamp(0, 6) as usize].0, osw(11.0), CREAM, 2.0);
+        let x = &p.bx[b];
+        for (i, (prm, name)) in [(&x.dynamics, "DYN"), (&x.bass, "BASS"), (&x.mid, "MID"), (&x.treble, "TREBLE"), (&x.presence, "PRES"), (&x.fb, "FDBK"), (&x.fb_freq, "FREQ"), (&x.mix, "MIX"), (&x.level, "LEVEL")].into_iter().enumerate() {
+            chicken(ui, setter, at(300.0 + i as f32 * 76.0, 708.0), 18.0, prm, name, CREAM, false, false);
+        }
+    }
     for (x, y, rot) in [(26.0, 80.0, 0.3), (26.0, 590.0, 1.1), (974.0, 80.0, 0.8), (974.0, 590.0, 2.0)] {
         screw(&pa, at(x, y), rot);
     }
@@ -1172,7 +1375,7 @@ fn analog_face(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnPar
     let tgt = (lo + 14.0).clamp(-20.0, 3.5);
     st.vu += (tgt - st.vu) * 0.18;
     vu(&pa, rc(104.0, 170.0, 250.0, 170.0), -20.0 + (st.vu + 20.0) * warm, warm);
-    let ty = p.ty.value().clamp(0, 5);
+    let ty = p.ty.value().clamp(0, 6);
     let tl = if ty <= T_POWER && !(ty == T_PRE && p.var.value() == 2) { TYPES[ty as usize].3[p.var.value().clamp(0, 2) as usize] } else { "12AX7" };
     tubes(&pa, rc(388.0, 170.0, 170.0, 170.0), warm, p.drive.value() / 24.0, tl, t);
 
@@ -1293,7 +1496,7 @@ fn analog_face(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnPar
         let prev = st.last_drive.unwrap_or(before);
         let d = p.drive.value() - prev;
         if d.abs() > 1e-4 {
-            for prm in [&p.drive2, &p.drive3] {
+            for prm in [&p.drive2, &p.drive3, &p.drive4, &p.drive5, &p.drive6] {
                 setter.begin_set_parameter(prm);
                 setter.set_parameter(prm, (prm.value() + d).clamp(0.0, 24.0));
                 setter.end_set_parameter(prm);
@@ -1308,6 +1511,11 @@ fn analog_face(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnPar
     lamp(&pa, at(846.0, 334.0), HEAT, nb > 1);
     worn_txt(&pa, at(858.0, 334.0), Align2::LEFT_CENTER, &if nb > 1 { format!("{nb} BANDS") } else { "1 BAND".to_string() }, osw(10.0), CREAM, 1.5);
     lamp(&pa, at(846.0, 356.0), HEAT, p.eq.value());
+    let any_mod = p.ms.iter().any(|m| m.src.value() > 0 && m.amount.value() != 0.0);
+    lamp(&pa, at(70.0, 752.0), COOL, any_mod);
+    worn_txt(&pa, at(82.0, 752.0), Align2::LEFT_CENTER, "MOD", osw(10.0), CREAM, 1.5);
+    lamp(&pa, at(140.0, 752.0), COOL, p.phase.value() == 1);
+    worn_txt(&pa, at(152.0, 752.0), Align2::LEFT_CENTER, "LINEAR PHASE", osw(10.0), CREAM, 1.5);
     worn_txt(&pa, at(858.0, 356.0), Align2::LEFT_CENTER, "CONSOLE EQ", osw(10.0), CREAM, 1.5);
     chicken(ui, setter, at(300.0, 468.0), 28.0, &p.color, "COLOR", CREAM, false, true);
     chicken(ui, setter, at(420.0, 468.0), 28.0, &p.depth, "DEPTH", CREAM, false, true);
@@ -1354,7 +1562,7 @@ fn analog_face(ui: &mut egui::Ui, setter: &ParamSetter, st: &mut St, p: &KilnPar
 
     // cold start: the whole unit comes up as the valves warm
     if warm < 1.0 {
-        pa.rect_filled(rc(0.0, 44.0, 1000.0, 616.0), 0.0, Color32::from_black_alpha((60.0 * (1.0 - warm)) as u8));
+        pa.rect_filled(rc(0.0, 44.0, 1000.0, 756.0), 0.0, Color32::from_black_alpha((60.0 * (1.0 - warm)) as u8));
     }
 }
 
@@ -1510,13 +1718,26 @@ mod tests {
         let mut texs = HashMap::new();
         // a second set with 3 bands + the console EQ on (fields are pub; values can't be set in tests)
         let mut q = KilnParams::default();
-        q.bands = IntParam::new("Bands", 3, IntRange::Linear { min: 1, max: 3 });
+        q.bands = IntParam::new("Bands", 6, IntRange::Linear { min: 1, max: 6 });
+        q.x3 = FloatParam::new("Split 3", 900.0, FloatRange::Linear { min: 20.0, max: 20000.0 });
+        q.x4 = FloatParam::new("Split 4", 7000.0, FloatRange::Linear { min: 20.0, max: 20000.0 });
+        q.x5 = FloatParam::new("Split 5", 60.0, FloatRange::Linear { min: 20.0, max: 20000.0 });
+        q.bx[1].fb = FloatParam::new("B2 Feedback", 0.4, FloatRange::Linear { min: 0.0, max: 1.0 });
+        q.bx[1].dynamics = FloatParam::new("B2 Dynamics", 0.5, FloatRange::Linear { min: -1.0, max: 1.0 });
+        q.ms[0].src = IntParam::new("Mod 1 Source", 1, IntRange::Linear { min: 0, max: 3 });
+        q.ms[0].target = IntParam::new("Mod 1 Target", 5, IntRange::Linear { min: 0, max: 29 });
+        q.ms[0].amount = FloatParam::new("Mod 1 Amount", 0.5, FloatRange::Linear { min: -1.0, max: 1.0 });
+        q.phase = IntParam::new("Phase", 1, IntRange::Linear { min: 0, max: 1 });
         q.eq = BoolParam::new("Console EQ", true);
         q.eq_mg = FloatParam::new("EQ Mid Gain", 6.0, FloatRange::Linear { min: -18.0, max: 18.0 });
         q.eq_lg = FloatParam::new("EQ Low Gain", -4.0, FloatRange::Linear { min: -16.0, max: 16.0 });
         q.eq_hpf = IntParam::new("EQ High-Pass", 2, IntRange::Linear { min: 0, max: 4 });
-        for (n, (analog, multi)) in [(false, false), (true, false), (false, true), (true, true)].iter().enumerate() {
-            let p = if *multi { &q } else { &p };
+        // and SPECIAL TAPE selected (shots 4, 5)
+        let mut s6 = KilnParams::default();
+        s6.ty = IntParam::new("Type", T_CHOW, IntRange::Linear { min: 0, max: 6 });
+        for (n, (analog, which)) in [(false, 0), (true, 0), (false, 1), (true, 1), (false, 2), (true, 2)].iter().enumerate() {
+            let multi = &(*which == 1);
+            let p = match which { 1 => &q, 2 => &s6, _ => &p };
             st.eq_tab = *multi;
             st.band = if *multi { 1 } else { 0 };
             p.analog.store(*analog, Ordering::Relaxed);

@@ -44,6 +44,20 @@ const PRESETS: &[(&str, P)] = &[
     ("BUS - Glue Lows, Clip Mids (3 bands)", &[("bands", 3.0), ("x1", 180.0), ("x2", 3500.0), ("type", 3.0), ("drive", 8.0), ("type2", 5.0), ("drive2", 6.0), ("color2", 0.2), ("byp3", 1.0), ("gmix", 0.7)]),
     ("MASTER - Console Polish", &[("type", 3.0), ("var", 0.0), ("drive", 4.0), ("gmix", 0.6), ("eq", 1.0), ("eqpos", 1.0), ("eqlf", 0.0), ("eqlg", 1.5), ("eqhg", 1.5)]),
     ("FX - Destroyed (SAFE holds it)", &[("type", 5.0), ("var", 1.0), ("drive", 24.0), ("color", 1.0), ("gmix", 0.5)]),
+    // 0.4: 6 bands, per-band DYNAMICS / TILT / FEEDBACK / MIX / LEVEL, LINEAR phase, modulation
+    ("KICK - Linear Punch (4 bands, LINEAR)", &[("phase", 1.0), ("bands", 4.0), ("x1", 60.0), ("x2", 150.0), ("x3", 2500.0), ("type", 1.0), ("drive", 6.0), ("type2", 4.0), ("drive2", 10.0), ("type3", 0.0), ("drive3", 8.0), ("dyn_3", -0.6), ("byp4", 1.0)]),
+    ("KICK - Snap Dynamics", &[("type", 4.0), ("var", 0.0), ("drive", 8.0), ("dyn_1", -0.8), ("slo", 60.0)]),
+    ("BASS - Singing Feedback", &[("type", 0.0), ("drive", 10.0), ("fb_1", 0.35), ("fbf_1", 110.0), ("bbass_1", 3.0), ("bpres_1", -4.0)]),
+    ("BUS - Band Mix Parallel Lows", &[("bands", 2.0), ("x1", 200.0), ("type", 3.0), ("drive", 14.0), ("bmix_1", 0.4), ("blvl_1", -2.0), ("type2", 2.0), ("drive2", 6.0)]),
+    ("DRUMS - Breathing Bus (Half Notes)", &[("type", 2.0), ("drive", 8.0), ("l1sync", 1.0), ("l1div", 5.0), ("l1shape", 0.0), ("msrc_1", 1.0), ("mtgt_1", 0.0), ("mamt_1", 0.35)]),
+    ("VOCAL - Loud Stays Smooth", &[("type", 0.0), ("drive", 10.0), ("dyn_1", 0.6), TAME, ("tamt", 0.4)]),
+    ("808 - 6-Band Rainbow", &[("bands", 6.0), ("x1", 60.0), ("x2", 150.0), ("x3", 500.0), ("x4", 2000.0), ("x5", 7000.0), ("type", 1.0), ("drive", 6.0), ("type2", 0.0), ("drive2", 10.0), ("type3", 4.0), ("drive3", 12.0), ("type4", 2.0), ("drive4", 8.0), ("type5", 6.0), ("drive5", 6.0), ("type6", 5.0), ("drive6", 4.0), ("gmix", 0.8)]),
+    ("MELODY - Random Tape Drift", &[("type", 6.0), ("var", 1.0), ("drive", 8.0), ("l2sync", 0.0), ("l2rate", 0.3), ("l2shape", 4.0), ("msrc_1", 2.0), ("mtgt_1", 1.0), ("mamt_1", 0.5), ("msrc_2", 2.0), ("mtgt_2", 0.0), ("mamt_2", 0.2)]),
+    ("FX - Envelope Fuzz Bloom", &[("type", 4.0), ("var", 1.0), ("drive", 2.0), ("eatt", 30.0), ("erel", 400.0), ("msrc_1", 3.0), ("mtgt_1", 0.0), ("mamt_1", 0.8)]),
+    ("SYNTH - Wobble Grit (8ths)", &[("type", 5.0), ("drive", 10.0), ("l1sync", 1.0), ("l1div", 1.0), ("l1shape", 1.0), ("msrc_1", 1.0), ("mtgt_1", 2.0), ("mamt_1", -0.6)]),
+    ("VOCAL - Tone Stack Presence", &[("type", 0.0), ("drive", 8.0), ("bmid_1", -3.0), ("bpres_1", 5.0), ("bbass_1", -2.0)]),
+    ("BASS - Amp Tone Stack", &[("type", 1.0), ("drive", 12.0), ("bbass_1", 6.0), ("bmid_1", -6.0), ("btreb_1", 3.0), ("fb_1", 0.2), ("fbf_1", 55.0)]),
+    ("MASTER - Linear 3-Band Polish", &[("phase", 1.0), ("bands", 3.0), ("x1", 120.0), ("x2", 5000.0), ("type", 3.0), ("drive", 4.0), ("type2", 2.0), ("drive2", 3.0), ("type3", 6.0), ("drive3", 2.0), ("gmix", 0.6)]),
 ];
 
 fn build(params: &KilnParams, over: P) -> Value {

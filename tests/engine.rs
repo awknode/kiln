@@ -31,12 +31,12 @@ fn all_types_bounded_and_silent_when_silent() {
         for var in 0..3 {
             for os in [0, 1] {
                 let mut k = kiln(move |v| {
-                    v.ty = ty;
-                    v.var = var;
+                    v.ty[0] = ty;
+                    v.var[0] = var;
                     v.os = os;
-                    v.drive = 24.0;
+                    v.drive[0] = 24.0;
                     v.depth = 1.0;
-                    v.color = 0.8;
+                    v.color[0] = 0.8;
                 });
                 let mut x = sine(110.0, 0.9, 24000);
                 x.extend(vec![0.0; 48000]);
@@ -57,9 +57,9 @@ fn auto_gain_holds_level() {
     for ty in 0..5 {
         for drive in [3.0, 12.0, 24.0] {
             let mut k = kiln(move |v| {
-                v.ty = ty;
+                v.ty[0] = ty;
                 v.safe = false;
-                v.drive = drive;
+                v.drive[0] = drive;
             });
             let x = sine(220.0, 0.25, 96000 * 2);
             let (l, _) = run(&mut k, &x);
@@ -93,8 +93,8 @@ fn clean_split_keeps_the_lows_clean() {
     let x = sine(50.0, 0.5, 48000);
     let go = |drive: f32| {
         let mut k = kiln(move |v| {
-            v.ty = 4;
-            v.drive = drive;
+            v.ty[0] = 4;
+            v.drive[0] = drive;
             v.auto = false;
             v.safe = false;
             v.slo = 300.0;
@@ -106,8 +106,8 @@ fn clean_split_keeps_the_lows_clean() {
     assert!(d < 0.03, "lows changed by {d}");
     // and without the split the same note is crushed
     let mut k = kiln(|v| {
-        v.ty = 4;
-        v.drive = 24.0;
+        v.ty[0] = 4;
+        v.drive[0] = 24.0;
         v.auto = false;
         v.safe = false;
     });
@@ -144,7 +144,7 @@ fn tame_turns_down_a_whistle() {
     let x: Vec<f32> = (0..96000).map(|i| 0.05 * noise() + 0.2 * (2.0 * PI * 2900.0 * i as f32 / SR).sin()).collect();
     let level_at = |on: bool| {
         let mut k = kiln(move |v| {
-            v.drive = 0.0;
+            v.drive[0] = 0.0;
             v.auto = false;
             v.tame = on;
             v.tamt = 0.8;
@@ -176,7 +176,7 @@ fn tame_range_is_respected() {
     let x: Vec<f32> = (0..96000).map(|i| 0.05 * noise() + 0.2 * (2.0 * PI * 2900.0 * i as f32 / SR).sin()).collect();
     let level = |tame: bool, lo: f32, hi: f32| {
         let mut k = kiln(move |v| {
-            v.drive = 0.0;
+            v.drive[0] = 0.0;
             v.auto = false;
             v.tame = tame;
             v.tamt = 0.8;
@@ -234,7 +234,7 @@ fn three_tones() -> Vec<f32> {
 fn multiband_bypassed_is_flat() {
     let mut k = kiln(|v| {
         v.bands = 3;
-        v.byp = [true; 3];
+        v.byp = [true; 6];
         v.auto = false;
     });
     let (l, _) = run(&mut k, &three_tones());
@@ -249,8 +249,8 @@ fn multiband_bypassed_is_flat() {
 fn solo_low_band() {
     let mut k = kiln(|v| {
         v.bands = 3;
-        v.solo = [true, false, false];
-        v.byp = [true; 3];
+        v.solo = [true, false, false, false, false, false];
+        v.byp = [true; 6];
     });
     let (l, _) = run(&mut k, &three_tones());
     let lo = 20.0 * (tone_at(&l, 80.0, 12000) / 0.1).log10();
@@ -267,7 +267,7 @@ fn console_eq_mid_boost() {
         v.eq_pos = 1;
         v.eq_mf = 2;
         v.eq_mg = 12.0;
-        v.byp = [true; 3];
+        v.byp = [true; 6];
     });
     let (l, _) = run(&mut k, &x);
     let d = 20.0 * (tone_at(&l, 1600.0, 12000) / 0.05).log10();
@@ -287,4 +287,224 @@ fn cpu_three_bands() {
     let pct = t.elapsed().as_secs_f32() / 10.0 * 100.0;
     println!("3 bands + TAME + EQ at 2x: {pct:.2}% of one core");
     assert!(pct < 15.0);
+}
+
+// ------------------------------------------------------------------ 0.4
+
+fn tones6() -> Vec<f32> {
+    (0..96000).map(|i| {
+        let t = i as f32 / SR;
+        [50.0, 150.0, 500.0, 1500.0, 5000.0, 12000.0].iter().map(|f| 0.05 * (2.0 * PI * f * t).sin()).sum::<f32>()
+    }).collect()
+}
+fn six(v: &mut Vals) {
+    v.bands = 6;
+    v.xs = [100.0, 300.0, 1000.0, 3000.0, 8000.0];
+    v.auto = false;
+}
+
+/// 6 bands, all bypassed, NATURAL and LINEAR: flat at every band's tone.
+#[test]
+fn six_bands_bypassed_are_flat() {
+    for phase in [0, 1] {
+        let mut k = kiln(move |v| {
+            six(v);
+            v.phase = phase;
+            v.byp = [true; 6];
+        });
+        let (l, _) = run(&mut k, &tones6());
+        for f in [50.0, 150.0, 500.0, 1500.0, 5000.0, 12000.0] {
+            let d = 20.0 * (tone_at(&l, f, 24000) / 0.05).log10();
+            println!("phase {phase} {f} Hz {d:+.3} dB");
+            assert!(d.abs() < 0.3, "phase {phase}: {f} Hz moved {d:.2} dB");
+        }
+    }
+}
+
+/// LINEAR with every band bypassed (and CLEAN LOWS/HIGHS on) is the input, delayed by the
+/// reported latency, sample for sample: no phase turn at all.
+#[test]
+fn linear_is_exact_delay() {
+    let mut k = kiln(|v| {
+        six(v);
+        v.phase = 1;
+        v.byp = [true; 6];
+        v.slo = 80.0;
+        v.shi = 9000.0;
+        v.safe = false;
+    });
+    let lat = k.latency();
+    assert!(lat > 3000, "LINEAR latency {lat}");
+    let x: Vec<f32> = (0..30000).map(|i| ((i * 7919) % 1000) as f32 / 1000.0 - 0.5).map(|v| v * 0.3).collect();
+    let (l, _) = run(&mut k, &x);
+    let mut worst = 0.0f32;
+    for n in lat + 4096..x.len() {
+        worst = worst.max((l[n] - x[n - lat]).abs());
+    }
+    println!("LINEAR lat {lat}, worst error {worst:.2e}");
+    assert!(worst < 2e-3, "LINEAR not an exact delay: {worst}");
+}
+
+/// The bands don't overlap much in LINEAR: soloing band 3 (300 Hz - 1 kHz) keeps 500 Hz and drops 50 Hz / 5 kHz.
+#[test]
+fn linear_solo_band_is_selective() {
+    let mut k = kiln(|v| {
+        six(v);
+        v.phase = 1;
+        v.byp = [true; 6];
+        v.solo = [false, false, true, false, false, false];
+    });
+    let (l, _) = run(&mut k, &tones6());
+    let at = |f: f32| 20.0 * (tone_at(&l, f, 24000) / 0.05).log10();
+    let (a, b, c) = (at(50.0), at(500.0), at(5000.0));
+    println!("solo B3: 50 Hz {a:.1}, 500 Hz {b:.1}, 5 kHz {c:.1}");
+    assert!(b.abs() < 2.0 && a < -40.0 && c < -40.0);
+}
+
+/// FEEDBACK at 100% on every type, max drive: bounded, and it dies away after the input stops.
+#[test]
+fn feedback_is_bounded_and_dies_away() {
+    for ty in 0..7 {
+        for fbf in [80.0, 800.0, 5000.0] {
+            let mut k = kiln(move |v| {
+                v.ty[0] = ty;
+                v.drive[0] = 24.0;
+                v.fb[0] = 1.0;
+                v.fbf[0] = fbf;
+                v.safe = false;
+            });
+            let mut x = sine(220.0, 0.5, 48000);
+            x.extend(std::iter::repeat(0.0).take(96000));
+            let (l, _) = run(&mut k, &x);
+            let pk = l.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let tail = rms(&l[130000..]);
+            assert!(pk.is_finite() && pk < 8.0, "type {ty} fb {fbf}: peak {pk}");
+            assert!(tail < 1e-3, "type {ty} fb {fbf}: still ringing {tail}");
+        }
+    }
+}
+
+/// FEEDBACK changes the sound (it isn't a no-op), DYNAMICS too, and LEVEL / band MIX do what they say.
+#[test]
+fn band_controls_do_something() {
+    let base = |v: &mut Vals| {
+        v.ty[0] = 0;
+        v.drive[0] = 12.0;
+        v.auto = false;
+        v.safe = false;
+    };
+    let render = |f: fn(&mut Vals)| -> Vec<f32> {
+        let mut k = kiln(move |v| {
+            base(v);
+            f(v);
+        });
+        // a plucked, decaying tone so DYNAMICS has loud and quiet parts
+        let x: Vec<f32> = (0..48000).map(|i| (-(i % 12000) as f32 / 2000.0).exp() * 0.5 * (2.0 * PI * 110.0 * i as f32 / SR).sin()).collect();
+        run(&mut k, &x).0
+    };
+    let dflt = render(|_| {});
+    let diff = |o: &[f32]| 20.0 * (rms(&o.iter().zip(&dflt).map(|(a, b)| a - b).collect::<Vec<_>>()) / rms(&dflt)).log10();
+    for (name, f) in [("feedback", (|v: &mut Vals| { v.fb[0] = 0.8; v.fbf[0] = 330.0; }) as fn(&mut Vals)), ("dynamics +", |v: &mut Vals| v.dynm[0] = 1.0), ("dynamics -", |v: &mut Vals| v.dynm[0] = -1.0), ("tilt", |v: &mut Vals| v.btone[0] = 6.0), ("bass", |v: &mut Vals| v.tsec[0][0] = 12.0)] {
+        let d = diff(&render(f));
+        println!("{name}: change {d:.1} dB");
+        assert!(d > -20.0, "{name} barely changes the sound ({d:.1} dB)");
+    }
+    let lv = render(|v| v.blvl[0] = -6.0);
+    let g = 20.0 * (rms(&lv) / rms(&dflt)).log10();
+    assert!((g + 6.0).abs() < 0.3, "LEVEL -6 gave {g:.2}");
+    let dry = render(|v| v.bmix[0] = 0.0);
+    let k0 = kiln(|_| {});
+    let lat = k0.latency();
+    let x: Vec<f32> = (0..48000).map(|i| (-(i % 12000) as f32 / 2000.0).exp() * 0.5 * (2.0 * PI * 110.0 * i as f32 / SR).sin()).collect();
+    let err = (lat + 100..48000).map(|n| (dry[n] - x[n - lat]).abs()).fold(0.0f32, f32::max);
+    assert!(err < 1e-3, "band MIX 0 isn't dry ({err})");
+}
+
+/// An LFO on DRIVE moves the level over time; with SYNC it follows the host tempo.
+#[test]
+fn lfo_modulates_drive() {
+    let mut k = kiln(|v| {
+        v.ty[0] = 4;
+        v.drive[0] = 6.0;
+        v.auto = false;
+        v.safe = false;
+        v.lfo[0] = (2.0, false, 3, 0);
+        v.mods[0] = (1, 0, 1.0); // LFO 1 -> B1 DRIVE, 100%
+    });
+    let (l, _) = run(&mut k, &sine(200.0, 0.05, 48000));
+    let win: Vec<f32> = l.chunks(2400).map(rms).collect();
+    let (mn, mx) = win.iter().fold((f32::MAX, 0.0f32), |(a, b), v| (a.min(*v), b.max(*v)));
+    let swing = 20.0 * (mx / mn).log10();
+    println!("LFO drive swing {swing:.1} dB");
+    assert!(swing > 10.0, "LFO barely moves the drive ({swing:.1} dB)");
+}
+
+/// ENV follower: louder input -> more drive when ENV -> DRIVE is up.
+#[test]
+fn env_modulates() {
+    let level = |amt: f32| {
+        let mut k = kiln(move |v| {
+            v.ty[0] = 4;
+            v.drive[0] = 0.0;
+            v.auto = false;
+            v.safe = false;
+            v.mods[0] = (3, 0, amt);
+        });
+        let (l, _) = run(&mut k, &sine(200.0, 0.02, 24000));
+        rms(&l[12000..])
+    };
+    let (a, b) = (level(0.0), level(1.0));
+    println!("env off {a:.4}, env on {b:.4}");
+    assert!(b > a * 1.5);
+}
+
+/// Tone section: each knob at +12 dB lifts its own region by about 12 dB and leaves the far end alone.
+#[test]
+fn tone_section_shapes() {
+    let tones: Vec<f32> = (0..96000).map(|i| {
+        let t = i as f32 / SR;
+        [40.0, 600.0, 12000.0].iter().map(|f| 0.02 * (2.0 * PI * f * t).sin()).sum::<f32>()
+    }).collect();
+    let lvl = |k: usize, g: f32| {
+        let mut kk = kiln(move |v| {
+            v.drive[0] = 0.0;
+            v.auto = false;
+            v.safe = false;
+            v.tsec[0][k] = g;
+        });
+        let (l, _) = run(&mut kk, &tones);
+        [40.0, 600.0, 12000.0].map(|f| 20.0 * (tone_at(&l, f, 24000)).log10())
+    };
+    let flat = lvl(0, 0.0);
+    for (k, name, hit, miss) in [(0, "BASS", 0, 2), (1, "MID", 1, 2), (2, "TREBLE", 2, 0), (3, "PRESENCE", 2, 0)] {
+        let u = lvl(k, 12.0);
+        let (h, m) = (u[hit] - flat[hit], u[miss] - flat[miss]);
+        println!("{name} +12: hit {h:+.1} dB, far end {m:+.1} dB");
+        assert!(h > 9.0 && m.abs() < 1.0, "{name}: {h:.1} / {m:.1}");
+    }
+}
+
+/// DYNAMICS + compresses (smaller loud/quiet gap), - expands; the level stays within a few dB.
+#[test]
+fn dynamics_compress_and_expand() {
+    let x: Vec<f32> = (0..96000).map(|i| (-((i % 12000) as f32) / 2900.0).exp() * 0.4 * (2.0 * PI * 110.0 * i as f32 / SR).sin()).collect();
+    let gap = |dynm: f32| {
+        let mut k = kiln(move |v| {
+            v.drive[0] = 6.0;
+            v.auto = false;
+            v.safe = false;
+            v.dynm[0] = dynm;
+        });
+        let (l, _) = run(&mut k, &x);
+        let seg = &l[48000..];
+        let loud: Vec<f32> = seg.chunks(12000).flat_map(|c| c[..1500].to_vec()).collect();
+        let quiet: Vec<f32> = seg.chunks(12000).flat_map(|c| c[6000..].to_vec()).collect();
+        (20.0 * (rms(&loud) / rms(&quiet)).log10(), 20.0 * rms(seg).log10())
+    };
+    let (g0, l0) = gap(0.0);
+    let (gp, lp) = gap(1.0);
+    let (gm, lm) = gap(-1.0);
+    println!("gap: off {g0:.1}, +100% {gp:.1}, -100% {gm:.1}; level {l0:.1} / {lp:.1} / {lm:.1}");
+    assert!(gp < g0 - 4.0 && gm > g0 + 3.0);
+    assert!((lp - l0).abs() < 4.0 && (lm - l0).abs() < 4.0);
 }

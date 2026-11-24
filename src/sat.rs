@@ -96,6 +96,18 @@ impl Blk {
                 b.p = p * (0.55 + 1.1 * c);
                 b.asym = a;
             }
+            T_CHOW => {
+                // STUDIO / CASSETTE / WORN = ChowTape reel / cassette / VHS machines.
+                // COLOR = tape speed + wear: low = worn and dark, high = clean and open.
+                let m = [1usize, 0, 2][var.clamp(0, 2) as usize];
+                let (speed, gap, thick, _sat, _width, _clip, max_sp) = crate::chow::MACHINES[m];
+                let spacing = 0.1 + (1.0 - c) * (1.0 - c) * max_sp;
+                let (bf, bdb) = crate::chow::head_bump(speed, gap);
+                b.bump_f = bf;
+                b.bump_db = bdb;
+                b.tape_lp = crate::chow::loss_corner(speed, spacing, thick, gap, 22000.0);
+                b.wow = [1.0, 1.6, 3.0][var.clamp(0, 2) as usize];
+            }
             _ => {
                 b.bits = 12.0 - c * 10.0;
             }
@@ -188,6 +200,7 @@ struct Chan {
     wpos: usize,
     hum_ph: f32,
     hold: f32,
+    hyst: crate::chow::Hyst,
 }
 impl Chan {
     fn new(factor: usize) -> Self {
@@ -206,6 +219,7 @@ impl Chan {
             wpos: 0,
             hum_ph: 0.0,
             hold: 0.0,
+            hyst: crate::chow::Hyst::new(48000.0),
         }
     }
 }
@@ -232,17 +246,23 @@ pub struct Sat {
     /// cached coefficients
     last: Option<(i32, i32, u32)>,
     pub ag_db: f32,
+    chow_mk: f32,
+    chow_clip: f32,
 }
 
 impl Sat {
     pub fn new(sr: f32, factor: usize) -> Self {
-        let mut s = Self { sr, factor, ch: [Chan::new(factor), Chan::new(factor)], seed: 12345, env: 0.0, env_rel: 0.0, drift: 0.0, drift_t: 0.0, wow_ph: 0.0, flut_ph: 0.0, ms_in: 0.0, ms_out: 0.0, ag: 1.0, ag_c: 0.0, last: None, ag_db: 0.0 };
+        let mut s = Self { sr, factor, ch: [Chan::new(factor), Chan::new(factor)], seed: 12345, env: 0.0, env_rel: 0.0, drift: 0.0, drift_t: 0.0, wow_ph: 0.0, flut_ph: 0.0, ms_in: 0.0, ms_out: 0.0, ag: 1.0, ag_c: 0.0, last: None, ag_db: 0.0, chow_mk: 1.0, chow_clip: 10.0 };
         s.env_rel = (-1.0 / (0.08 * sr)).exp();
         s.ag_c = 1.0 - (-1.0 / (0.35 * sr)).exp();
         s
     }
     pub fn factor(&self) -> usize {
         self.factor
+    }
+    /// current AUTO GAIN (linear)
+    pub fn ag(&self) -> f32 {
+        self.ag
     }
     pub fn clear(&mut self) {
         let f = self.factor;
@@ -259,6 +279,19 @@ impl Sat {
             return;
         }
         self.last = Some(key);
+        if b.ty == T_CHOW {
+            let m = [1usize, 0, 2][b.var.clamp(0, 2) as usize];
+            let (_, _, _, sat, width, clip, _) = crate::chow::MACHINES[m];
+            let fs_os = self.sr * self.factor as f32;
+            for c in self.ch.iter_mut() {
+                c.hyst.set_sr(fs_os);
+                c.hyst.cook(0.5, width, sat);
+            }
+            // level-matched to TAPE's variants (fair A/B)
+            let trim = [1.41, 1.0, 1.33][b.var.clamp(0, 2) as usize];
+            self.chow_mk = crate::chow::Hyst::makeup(width, sat) / (0.4 + 1.5 * 0.5) * trim;
+            self.chow_clip = clip;
+        }
         for c in self.ch.iter_mut() {
             c.bump.peak(b.bump_f, 0.9, b.bump_db, self.sr);
             c.tape_lp.lowpass(b.tape_lp.min(self.sr * 0.45), 0.6, self.sr);
@@ -334,7 +367,7 @@ impl Sat {
             bias += depth * 0.25 * self.drift;
         }
         // tape wow + flutter: modulated delay (0 .. a couple of ms), before the drive
-        let wow_on = b.ty == T_TAPE && depth > 0.0;
+        let wow_on = (b.ty == T_TAPE || b.ty == T_CHOW) && depth > 0.0;
         let (mut wd, mut fd) = (0.0, 0.0);
         if wow_on {
             self.wow_ph = (self.wow_ph + 0.7 / sr).fract();
@@ -374,13 +407,24 @@ impl Sat {
             c.sag_env += sag_a * (u_in.abs() - c.sag_env);
             let mut buf = [0.0f32; MAX_FACTOR];
             c.os.up(u_in, &mut buf);
-            for v in buf.iter_mut().take(factor) {
-                *v = Self::shape(c, *v, b, bias, iron_a);
+            if b.ty == T_CHOW {
+                let (mk, cl) = (self.chow_mk, self.chow_clip);
+                for v in buf.iter_mut().take(factor) {
+                    *v = c.hyst.tick(v.clamp(-cl, cl)) * mk;
+                }
+            } else {
+                for v in buf.iter_mut().take(factor) {
+                    *v = Self::shape(c, *v, b, bias, iron_a);
+                }
             }
             let mut y = c.os.down(&mut buf);
             if b.ty == T_TAPE {
                 let hp = y - c.post_hp.lp(y, deemph_a);
                 y += (1.0 / b.emph - 1.0) * hp;
+                y = c.bump.tick(y);
+                y = c.tape_lp.tick(y);
+            } else if b.ty == T_CHOW {
+                // playback loss + head bump (ChowTape's loss model)
                 y = c.bump.tick(y);
                 y = c.tape_lp.tick(y);
             }
@@ -398,7 +442,7 @@ impl Sat {
         if depth > 0.0 {
             let e = self.env.min(1.0);
             let hiss = depth * e * match b.ty {
-                T_TAPE => 10f32.powf(-46.0 / 20.0),
+                T_TAPE | T_CHOW => 10f32.powf(-46.0 / 20.0),
                 T_DIGITAL => 10f32.powf(-50.0 / 20.0),
                 _ => 10f32.powf(-58.0 / 20.0),
             };
@@ -451,7 +495,7 @@ pub fn curve_points(ty: i32, var: i32, color: f32, drive_db: f32, n: usize) -> V
             let x = -1.0 + 2.0 * i as f32 / n as f32;
             c.iron_lp.z = 0.0;
             let u = x * g;
-            let y = if b.ty == T_TAPE { u.atan() } else { Sat::shape(&mut c, u, &b, b.bias, if b.iron_f > 0.0 { iron_a } else { 0.0 }) };
+            let y = if b.ty == T_TAPE || b.ty == T_CHOW { u.atan() } else { Sat::shape(&mut c, u, &b, b.bias, if b.iron_f > 0.0 { iron_a } else { 0.0 }) };
             (x, y)
         })
         .collect();
@@ -594,74 +638,239 @@ impl Split {
 
 // ------------------------------------------------------------------ 0.2: multiband split
 
-#[derive(Clone, Copy, Default)]
-struct B3Ch {
-    lp1: Lr4,
-    hp1: Lr4,
-    lp2: Lr4,
-    hp2: Lr4,
-    ap_lp: Lr4,
-    ap_hp: Lr4,
-}
-
-/// 1, 2 or 3 bands with Linkwitz-Riley crossovers: the bands add back up flat
-/// (all-passed), so un-driven bands sound like the input.
-pub struct Bands3 {
+/// Up to 6 bands with Linkwitz-Riley crossovers (a tree, with all-pass compensation so
+/// the bands add back up flat, all-passed). Splits come in sorted.
+pub struct BandsN {
     sr: f32,
     pub n: usize,
-    f1: f32,
-    f2: f32,
-    ch: [B3Ch; 2],
+    f: [f32; MAXB - 1],
+    lp: [[Lr4; MAXB - 1]; 2],
+    hp: [[Lr4; MAXB - 1]; 2],
+    /// [ch][band][split]: the all-pass (lp + hp) at a higher split for a lower band
+    ap: [[[(Lr4, Lr4); MAXB - 1]; MAXB]; 2],
 }
-impl Bands3 {
+impl BandsN {
     pub fn new(sr: f32) -> Self {
-        Self { sr, n: 1, f1: -1.0, f2: -1.0, ch: [B3Ch::default(); 2] }
+        Self { sr, n: 1, f: [-1.0; MAXB - 1], lp: [[Lr4::default(); MAXB - 1]; 2], hp: [[Lr4::default(); MAXB - 1]; 2], ap: [[[(Lr4::default(), Lr4::default()); MAXB - 1]; MAXB]; 2] }
     }
-    pub fn set(&mut self, n: usize, f1: f32, f2: f32) {
-        self.n = n.clamp(1, 3);
+    /// `splits` sorted low to high; only the first n-1 are used.
+    pub fn set(&mut self, n: usize, splits: &[f32; MAXB - 1]) {
+        self.n = n.clamp(1, MAXB);
         let sr = self.sr;
-        let f1 = f1.clamp(20.0, sr * 0.4);
-        let f2 = f2.max(f1 * 1.5).min(sr * 0.45);
-        if (f1 - self.f1).abs() > 0.01 {
-            self.f1 = f1;
-            for c in self.ch.iter_mut() {
-                c.lp1.lp(f1, sr);
-                c.hp1.hp(f1, sr);
-            }
-        }
-        if (f2 - self.f2).abs() > 0.01 {
-            self.f2 = f2;
-            for c in self.ch.iter_mut() {
-                c.lp2.lp(f2, sr);
-                c.hp2.hp(f2, sr);
-                c.ap_lp.lp(f2, sr);
-                c.ap_hp.hp(f2, sr);
+        let mut prev = 10.0f32;
+        for j in 0..self.n - 1 {
+            let f = splits[j].max(prev * 1.02).clamp(20.0, sr * 0.45);
+            prev = f;
+            if (f - self.f[j]).abs() > 0.01 {
+                self.f[j] = f;
+                for c in 0..2 {
+                    self.lp[c][j].lp(f, sr);
+                    self.hp[c][j].hp(f, sr);
+                    for b in 0..MAXB {
+                        self.ap[c][b][j].0.lp(f, sr);
+                        self.ap[c][b][j].1.hp(f, sr);
+                    }
+                }
             }
         }
     }
     pub fn clear(&mut self) {
-        for c in self.ch.iter_mut() {
-            for f in [&mut c.lp1, &mut c.hp1, &mut c.lp2, &mut c.hp2, &mut c.ap_lp, &mut c.ap_hp] {
-                f.clear();
+        for c in 0..2 {
+            for j in 0..MAXB - 1 {
+                self.lp[c][j].clear();
+                self.hp[c][j].clear();
+                for b in 0..MAXB {
+                    self.ap[c][b][j].0.clear();
+                    self.ap[c][b][j].1.clear();
+                }
             }
         }
     }
     #[inline]
-    pub fn tick(&mut self, ch: usize, x: f32) -> [f32; 3] {
-        let c = &mut self.ch[ch];
-        match self.n {
-            1 => [x, 0.0, 0.0],
-            2 => [c.lp1.tick(x), c.hp1.tick(x), 0.0],
-            _ => {
-                let low = c.lp1.tick(x);
-                let rest = c.hp1.tick(x);
-                let mid = c.lp2.tick(rest);
-                let high = c.hp2.tick(rest);
-                let a = c.ap_lp.tick(low);
-                let low = a + c.ap_hp.tick(low);
-                [low, mid, high]
+    pub fn tick(&mut self, ch: usize, x: f32) -> [f32; MAXB] {
+        let n = self.n;
+        let mut out = [0.0; MAXB];
+        let mut rest = x;
+        for k in 0..n - 1 {
+            out[k] = self.lp[ch][k].tick(rest);
+            rest = self.hp[ch][k].tick(rest);
+        }
+        out[n - 1] = rest;
+        for k in 0..n.saturating_sub(2) {
+            for j in k + 1..n - 1 {
+                let (a, b) = &mut self.ap[ch][k][j];
+                let y = out[k];
+                out[k] = a.tick(y) + b.tick(y);
             }
         }
+        out
+    }
+}
+
+// ------------------------------------------------------------------ 0.4: linear-phase split
+
+use realfft::{num_complex::Complex, ComplexToReal, RealFftPlanner, RealToComplex};
+use std::sync::Arc;
+
+const LN: usize = 4096;
+const LB: usize = 2048;
+const LHALF: usize = 1024;
+/// Latency of the LINEAR split (block + half the kernel), the same at every sample rate.
+pub const LIN_LAT: usize = LB + LHALF;
+/// streams: up to 6 bands + the CLEAN (lows/highs that go around the drive)
+const NS: usize = MAXB + 1;
+
+/// LINEAR phase: the bands (and CLEAN LOWS / HIGHS) split with linear-phase FIR filters,
+/// run by FFT (overlap-save). The bands always add back up to exactly the input, delayed.
+/// The band shapes match the natural crossovers' slopes (24 dB/oct), with no phase turn.
+pub struct LinSplit {
+    sr: f32,
+    fwd: Arc<dyn RealToComplex<f32>>,
+    inv: Arc<dyn ComplexToReal<f32>>,
+    h: Vec<Vec<Complex<f32>>>,
+    want: (usize, [f32; MAXB - 1], f32, f32),
+    have: (usize, [f32; MAXB - 1], f32, f32),
+    frame: [Vec<f32>; 2],
+    out: [Vec<Vec<f32>>; 2],
+    pos: [usize; 2],
+    tbuf: Vec<f32>,
+    kbuf: Vec<f32>,
+    spec: Vec<Complex<f32>>,
+    ybuf: Vec<Complex<f32>>,
+    scr_f: Vec<Complex<f32>>,
+    scr_i: Vec<Complex<f32>>,
+    mask: Vec<f32>,
+}
+impl LinSplit {
+    pub fn new(sr: f32) -> Self {
+        let mut pl = RealFftPlanner::<f32>::new();
+        let fwd = pl.plan_fft_forward(LN);
+        let inv = pl.plan_fft_inverse(LN);
+        let nb = LN / 2 + 1;
+        let scr_f = fwd.make_scratch_vec();
+        let scr_i = inv.make_scratch_vec();
+        let mut s = Self {
+            sr,
+            fwd,
+            inv,
+            h: vec![vec![Complex::new(0.0, 0.0); nb]; NS],
+            want: (1, [200.0, 1000.0, 3000.0, 6000.0, 10000.0], 20.0, 20000.0),
+            have: (0, [0.0; MAXB - 1], 0.0, 0.0),
+            frame: [vec![0.0; LN], vec![0.0; LN]],
+            out: [vec![vec![0.0; LB]; NS], vec![vec![0.0; LB]; NS]],
+            pos: [0; 2],
+            tbuf: vec![0.0; LN],
+            kbuf: vec![0.0; LN],
+            spec: vec![Complex::new(0.0, 0.0); nb],
+            ybuf: vec![Complex::new(0.0, 0.0); nb],
+            scr_f,
+            scr_i,
+            mask: vec![0.0; nb],
+        };
+        s.design();
+        s
+    }
+    pub fn clear(&mut self) {
+        for c in 0..2 {
+            self.frame[c].iter_mut().for_each(|v| *v = 0.0);
+            self.out[c].iter_mut().flatten().for_each(|v| *v = 0.0);
+            self.pos[c] = 0;
+        }
+    }
+    /// `splits` sorted; `slo`/`shi` = CLEAN LOWS / HIGHS (off at 20 Hz / 20 kHz).
+    pub fn set(&mut self, n: usize, splits: &[f32; MAXB - 1], slo: f32, shi: f32) {
+        self.want = (n.clamp(1, MAXB), *splits, slo, shi);
+    }
+    fn lp_shape(f: f32, fc: f32) -> f32 {
+        let r = (f / fc).powi(4);
+        1.0 / (1.0 + r)
+    }
+    fn design(&mut self) {
+        let (n, sp, slo, shi) = self.want;
+        self.have = self.want;
+        let nb = LN / 2 + 1;
+        let df = self.sr / LN as f32;
+        let lo_on = Split::lo_on(slo);
+        let hi_on = Split::hi_on(shi);
+        for s in 0..NS {
+            for j in 0..nb {
+                let f = j as f32 * df;
+                // the part that gets driven (between CLEAN LOWS and CLEAN HIGHS)
+                let m = if hi_on { Self::lp_shape(f, shi) } else { 1.0 } - if lo_on { Self::lp_shape(f, slo) } else { 0.0 };
+                let edge = |k: usize| -> f32 {
+                    if k == 0 {
+                        0.0
+                    } else if k >= n {
+                        1.0
+                    } else {
+                        Self::lp_shape(f, sp[k - 1].max(1.0))
+                    }
+                };
+                self.mask[j] = if s < MAXB {
+                    if s < n { m * (edge(s + 1) - edge(s)) } else { 0.0 }
+                } else {
+                    1.0 - m
+                };
+            }
+            // zero-phase mask -> impulse response, centred, windowed, back to a spectrum
+            for j in 0..nb {
+                self.ybuf[j] = Complex::new(self.mask[j], 0.0);
+            }
+            let _ = self.inv.process_with_scratch(&mut self.ybuf, &mut self.tbuf, &mut self.scr_i);
+            let norm = 1.0 / (LN as f32 * LN as f32);
+            for i in 0..LN {
+                self.kbuf[i] = if i <= 2 * LHALF {
+                    let d = i as isize - LHALF as isize;
+                    let w = 0.5 + 0.5 * (std::f32::consts::PI * d as f32 / (LHALF as f32 + 1.0)).cos();
+                    self.tbuf[d.rem_euclid(LN as isize) as usize] * w * norm
+                } else {
+                    0.0
+                };
+            }
+            let _ = self.fwd.process_with_scratch(&mut self.kbuf, &mut self.h[s], &mut self.scr_f);
+        }
+    }
+    /// One sample of one channel in; every stream out (LIN_LAT samples late).
+    /// Streams 0..MAXB are the bands, MAXB is the CLEAN part.
+    #[inline]
+    pub fn tick(&mut self, ch: usize, x: f32) -> [f32; NS] {
+        let p = self.pos[ch];
+        self.frame[ch][LB + p] = x;
+        let mut o = [0.0; NS];
+        for s in 0..NS {
+            o[s] = self.out[ch][s][p];
+        }
+        self.pos[ch] = p + 1;
+        if self.pos[ch] == LB {
+            self.pos[ch] = 0;
+            if ch == 0 && self.want != self.have {
+                self.design();
+            }
+            self.block(ch);
+        }
+        o
+    }
+    fn block(&mut self, ch: usize) {
+        self.tbuf.copy_from_slice(&self.frame[ch]);
+        let _ = self.fwd.process_with_scratch(&mut self.tbuf, &mut self.spec, &mut self.scr_f);
+        let n = self.have.0;
+        let nb = LN / 2 + 1;
+        for s in 0..NS {
+            let out = &mut self.out[ch][s];
+            if s < MAXB && s >= n {
+                out.iter_mut().for_each(|v| *v = 0.0);
+                continue;
+            }
+            for j in 0..nb {
+                self.ybuf[j] = self.spec[j] * self.h[s][j];
+            }
+            self.ybuf[0].im = 0.0;
+            self.ybuf[nb - 1].im = 0.0;
+            let _ = self.inv.process_with_scratch(&mut self.ybuf, &mut self.tbuf, &mut self.scr_i);
+            out.copy_from_slice(&self.tbuf[LB..LN]);
+        }
+        // slide: the new half becomes the old half
+        self.frame[ch].copy_within(LB..LN, 0);
     }
 }
 
@@ -775,4 +984,29 @@ impl ConsoleEq {
 #[allow(non_snake_case)]
 pub fn EQ_HPF_HZ(i: i32) -> f32 {
     EQ_HPF[i.clamp(0, EQ_HPF.len() as i32 - 1) as usize].1
+}
+
+#[cfg(test)]
+mod chow_ab {
+    use super::*;
+    /// TAPE vs SPECIAL TAPE at the same settings: stable, and close in level (fair A/B).
+    #[test]
+    fn special_tape_ab() {
+        let sr = 48000.0f32;
+        let x: Vec<f32> = (0..(sr * 1.5) as usize).map(|i| { let t = i as f32 / sr; (std::f32::consts::TAU * 110.0 * t).sin() * 0.4 + (std::f32::consts::TAU * 2200.0 * t).sin() * 0.1 }).collect();
+        let rms = |v: &[f32]| (v.iter().map(|a| a * a).sum::<f32>() / v.len() as f32).sqrt();
+        let db = |v: f32| 20.0 * v.max(1e-9).log10();
+        for ty in [T_TAPE, T_CHOW] {
+            for var in 0..3 {
+                for drive_db in [0.0f32, 9.0, 18.0, 24.0] {
+                    let b = Blk::new(ty, var, 0.5, 0.0);
+                    let mut s = Sat::new(sr, 2);
+                    let g = 10f32.powf(drive_db / 20.0);
+                    let y: Vec<f32> = x.iter().map(|&v| s.tick(v, v, &b, g, 0.0, false).0).collect();
+                    assert!(y.iter().all(|v| v.is_finite()));
+                    println!("{} {} drive {:>2.0} dB: level {:+5.1} dB", TYPES[ty as usize].0, TYPES[ty as usize].3[var as usize], drive_db, db(rms(&y[4800..])) - db(rms(&x[4800..])));
+                }
+            }
+        }
+    }
 }
